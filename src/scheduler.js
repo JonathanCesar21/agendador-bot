@@ -1,20 +1,24 @@
 // /bot/src/scheduler.js
 import cron from "node-cron";
+import { db } from "./firebaseClient.js";
 import {
-  db,
-} from "./firebaseClient.js";
-import {
-  query, where, orderBy, getDocs, Timestamp, collectionGroup
+  query,
+  where,
+  orderBy,
+  getDocs,
+  Timestamp,
+  collectionGroup,
 } from "firebase/firestore";
 import { parseBooking, sendReminder } from "./handlers.js";
 
-export function startReminderCron(waClient) {
+/** Executa a cada 1 minuto e manda lembretes T-2h */
+export function startReminderCron() {
   const warmup = Number(process.env.REMINDER_WARMUP_MINUTES || 5);
 
   cron.schedule("* * * * *", async () => {
     const now = new Date();
     const start = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-    const end   = new Date(start.getTime() + warmup * 60 * 1000);
+    const end = new Date(start.getTime() + warmup * 60 * 1000);
 
     try {
       const qPriv = query(
@@ -37,7 +41,7 @@ export function startReminderCron(waClient) {
           if (b.status === "cancelado") continue;
           if (b.lembreteEnviado) continue;
           if (!b.clienteTelefone) continue;
-          await sendReminder({ waClient, booking: { ...b, clienteTelefone: b.clienteTelefone } });
+          await sendReminder({ booking: b });
         }
       }
     } catch (e) {
@@ -45,5 +49,5 @@ export function startReminderCron(waClient) {
     }
   });
 
-  console.log("[scheduler] lembretes T-2h iniciados (*/1m)");
+  console.log("[scheduler] lembretes T-2h iniciados (*/1m) — multi-tenant");
 }

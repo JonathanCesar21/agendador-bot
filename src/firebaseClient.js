@@ -1,4 +1,4 @@
-// /bot/src/firebaseClient.js
+// src/firebaseClient.js
 import "dotenv/config";
 import { initializeApp } from "firebase/app";
 import {
@@ -33,15 +33,17 @@ export async function loginBot() {
   if (!email || !password) throw new Error("Defina BOT_EMAIL e BOT_PASSWORD");
   await signInWithEmailAndPassword(auth, email, password);
   return new Promise((resolve) => {
-    onAuthStateChanged(auth, (u) => {
-      if (u) resolve(u);
-    });
+    onAuthStateChanged(auth, (u) => { if (u) resolve(u); });
   });
 }
 
 // Helpers “equivalentes” aos do Admin:
 export const cgAgPriv = () => collectionGroup(db, "agendamentos");
 export const cgAgPub  = () => collectionGroup(db, "agendamentos_publicos");
+
+export function botDocRef(estabelecimentoId) {
+  return doc(db, "bots", estabelecimentoId);
+}
 
 export async function getEstabelecimento(estabelecimentoId) {
   if (!estabelecimentoId) return null;
@@ -51,15 +53,9 @@ export async function getEstabelecimento(estabelecimentoId) {
 }
 
 export async function markConfirmSent(dref) {
-  await updateDoc(dref, {
-    confirmacaoEnviada: true,
-    confirmacaoEnviadaEm: serverTimestamp()
-  });
+  await updateDoc(dref, { confirmacaoEnviada: true, confirmacaoEnviadaEm: serverTimestamp() });
 }
 
 export async function markReminderSent(dref) {
-  await updateDoc(dref, {
-    lembreteEnviado: true,
-    lembreteEnviadoEm: serverTimestamp()
-  });
+  await updateDoc(dref, { lembreteEnviado: true, lembreteEnviadoEm: serverTimestamp() });
 }

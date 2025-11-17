@@ -1,7 +1,8 @@
 // /bot/src/handlers.js
 import { buildConfirmacao, buildLembrete } from "./templates.js";
-import { getEstabelecimento, markConfirmSent, markReminderSent } from "./firebaseClient.js";
-import { resolveWid } from "./whatsapp.js";
+import { getEstabelecimento, markConfirmSent, markReminderSent, db } from "./firebaseClient.js";
+import { getClientFor, resolveWid } from "./whatsapp.js";
+import { collectionGroup, getDocs, query, where, orderBy, Timestamp } from "firebase/firestore";
 
 export function parseBooking(snap) {
   const data = snap.data() || {};
@@ -19,17 +20,28 @@ export function parseBooking(snap) {
     status: data.status,
     inicio,
     confirmacaoEnviada: !!data.confirmacaoEnviada,
-    lembreteEnviado: !!data.lembreteEnviado
+    lembreteEnviado: !!data.lembreteEnviado,
   };
 }
 
-export async function maybeSendConfirm({ waClient, booking }) {
-  const allowed = (process.env.CONFIRM_SEND_ON_STATUS || "agendado,confirmado")
-    .split(",").map(s => s.trim());
+function allowedStatuses() {
+  return (process.env.CONFIRM_SEND_ON_STATUS || "agendado,confirmado")
+    .split(",")
+    .map((s) => s.trim());
+}
 
-  if (!booking.inicio || !booking.clienteTelefone) return;
+/** Envio de confirmação (on-change) — idempotente */
+export async function maybeSendConfirm({ booking }) {
+  const allowed = allowedStatuses();
+  if (!booking?.inicio || !booking?.clienteTelefone) return;
   if (booking.confirmacaoEnviada) return;
   if (!allowed.includes(String(booking.status || ""))) return;
+
+  const waClient = getClientFor(booking.estabelecimentoId);
+  if (!waClient) {
+    console.warn("[CONFIRM] skip: WA client não conectado para est:", booking.estabelecimentoId);
+    return;
+  }
 
   const est = await getEstabelecimento(booking.estabelecimentoId);
   const estabelecimentoNome = est?.nome || "seu estabelecimento";
@@ -37,13 +49,13 @@ export async function maybeSendConfirm({ waClient, booking }) {
     clienteNome: booking.clienteNome,
     estabelecimentoNome,
     inicio: booking.inicio,
-    servico: booking.servico
+    servico: booking.servico,
   });
 
   const wid = await resolveWid(waClient, booking.clienteTelefone);
-  if (!wid) {
-    console.warn("[CONFIRM] número sem WhatsApp ou inválido:", booking.clienteTelefone, "booking:", booking.id);
-    return; // não marca como enviado
+  if (!wid || !wid.endsWith("@c.us")) {
+    console.warn("[CONFIRM] skip: WID inválido ou grupo:", wid, "tel:", booking.clienteTelefone);
+    return;
   }
 
   await waClient.sendMessage(wid, msg);
@@ -51,9 +63,13 @@ export async function maybeSendConfirm({ waClient, booking }) {
   console.log("[CONFIRM] OK →", wid, booking.id);
 }
 
-export async function sendReminder({ waClient, booking }) {
-  if (!booking.inicio || !booking.clienteTelefone) return;
+/** Envio de lembrete (cron T-2h) — idempotente */
+export async function sendReminder({ booking }) {
+  if (!booking?.inicio || !booking?.clienteTelefone) return;
   if (booking.lembreteEnviado) return;
+
+  const waClient = getClientFor(booking.estabelecimentoId);
+  if (!waClient) return;
 
   const est = await getEstabelecimento(booking.estabelecimentoId);
   const estabelecimentoNome = est?.nome || "seu estabelecimento";
@@ -61,16 +77,50 @@ export async function sendReminder({ waClient, booking }) {
     clienteNome: booking.clienteNome,
     estabelecimentoNome,
     inicio: booking.inicio,
-    servico: booking.servico
+    servico: booking.servico,
   });
 
   const wid = await resolveWid(waClient, booking.clienteTelefone);
-  if (!wid) {
-    console.warn("[REMINDER] número sem WhatsApp ou inválido:", booking.clienteTelefone, "booking:", booking.id);
-    return; // não marca como enviado
+  if (!wid || !wid.endsWith("@c.us")) {
+    console.warn("[REMINDER] skip: WID inválido ou grupo:", wid, "tel:", booking.clienteTelefone);
+    return;
   }
 
   await waClient.sendMessage(wid, msg);
   await markReminderSent(booking.ref);
   console.log("[REMINDER] OK →", wid, booking.id);
+}
+
+/** Catch-up: quando o WA fica READY, envia confirmações pendentes recentes */
+export async function catchUpConfirmationsFor(estId) {
+  const allowed = allowedStatuses();
+  const since = Timestamp.fromDate(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
+
+  async function runOnGroup(groupName) {
+    const q = query(
+      collectionGroup(db, groupName),
+      where("estabelecimentoId", "==", estId),
+      where("criadoEm", ">=", since),
+      orderBy("criadoEm", "asc")
+    );
+    const snap = await getDocs(q);
+    let sent = 0;
+    for (const d of snap.docs) {
+      const b = parseBooking(d);
+      if (!b.clienteTelefone) continue;
+      if (b.confirmacaoEnviada) continue;
+      if (!allowed.includes(String(b.status || ""))) continue;
+      try {
+        await maybeSendConfirm({ booking: b });
+        sent++;
+      } catch (e) {
+        console.warn("[catch-up] falha ao enviar confirm para", b.id, e?.message || e);
+      }
+    }
+    return sent;
+  }
+
+  const a = await runOnGroup("agendamentos");
+  const b = await runOnGroup("agendamentos_publicos");
+  console.log(`[catch-up] est=${estId} confirmações enviadas: ${a + b}`);
 }
