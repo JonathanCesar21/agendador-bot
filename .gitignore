@@ -1,0 +1,70 @@
+# --- Node / Monorepo ---
+node_modules/
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+.cache/
+.tmp/
+temp/
+tmp/
+
+# --- Builds / Bundles ---
+dist/
+build/
+coverage/
+out/
+release/
+*.asar
+
+# --- Env (NÃO subir segredos) ---
+.env
+.env.*        # .env.local, .env.production, etc
+!.env.example # mantenha um exemplo sem segredos
+
+# --- WhatsApp Web (sessão local) ---
+.wwebjs_auth/
+.wwebjs_cache/
+.wwebjs-session
+wwebjs_auth/
+wwebjs_cache/
+
+# --- Puppeteer / Chromium perfis temporários ---
+puppeteer*
+.chromium/
+.chrome/
+.user-data-dir/
+**/User Data/
+**/Crashpad/
+
+# --- SO / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json   # (opcional: mantenha configs não sensíveis)
+
+# --- Firebase / Emuladores ---
+.firebase/
+firestore-debug.log
+
+# --- Vite / React ---
+*.local
+*.pid
+*.pid.lock
+
+# --- Electron (artefatos) ---
+*.dmg
+*.exe
+*.msi
+*.blockmap
+*.zip
+*.7z
+
+# --- Misc ---
+*.tgz
