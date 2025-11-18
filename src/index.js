@@ -1,7 +1,6 @@
-// /bot/src/index.js
 import "dotenv/config";
-import { loginBot, db, cgAgPriv, cgAgPub } from "./firebaseClient.js";
-import { startClientFor, stopClientFor, onClientReady } from "./whatsapp.js";
+import { loginBot, db, cgAgPriv, cgAgPub, botDocRef } from "./firebaseClient.js";
+import { startClientFor, stopClientFor, onClientReady, clearAuthFor } from "./whatsapp.js";
 import { startReminderCron } from "./scheduler.js";
 import {
   onSnapshot,
@@ -9,6 +8,7 @@ import {
   query,
   where,
   Timestamp,
+  updateDoc,
 } from "firebase/firestore";
 import { parseBooking, maybeSendConfirm, catchUpConfirmationsFor } from "./handlers.js";
 
@@ -72,14 +72,31 @@ async function setupWatchersForRecentConfirmations() {
         const estId = ch.doc.id;
         const data = ch.doc.data() || {};
         const flag = !!data.start;
+        const cmd  = (data.command || "").toLowerCase();
 
+        // 1) Comando explícito de desconexão → derruba, limpa sessão e reinicia (gera novo QR)
+        if (cmd === "disconnect") {
+          console.log("[bots supervisor] command=disconnect est=%s", estId);
+          try {
+            await stopClientFor(estId);
+            await clearAuthFor(estId);      // apaga sessão LocalAuth
+            await startClientFor(estId);    // religa → QR novo
+            await updateDoc(botDocRef(estId), { command: "done" });
+          } catch (e) {
+            console.error("[bots supervisor] disconnect error est=%s err=%s", estId, e?.message || e);
+            try { await updateDoc(botDocRef(estId), { command: "error" }); } catch {}
+          }
+          continue; // evita cair na lógica de debounce start/stop abaixo nesse ciclo
+        }
+
+        // 2) Debounce do campo start
         const prev = lastStartFlag.get(estId);
-        if (prev === flag) continue; // ignora ruído
-        lastStartFlag.set(estId, flag);
-
-        console.log("[bots supervisor] change=%s est=%s start=%s", ch.type, estId, flag);
-        if (flag) await startClientFor(estId);
-        else await stopClientFor(estId);
+        if (prev !== flag) {
+          lastStartFlag.set(estId, flag);
+          console.log("[bots supervisor] change=%s est=%s start=%s", ch.type, estId, flag);
+          if (flag) await startClientFor(estId);
+          else await stopClientFor(estId);
+        }
       }
     }, (err) => {
       console.error("[bot supervisor] onSnapshot /bots err:", err);

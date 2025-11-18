@@ -1,9 +1,10 @@
-// /bot/src/whatsapp.js
 import pkg from "whatsapp-web.js";
 const { Client, LocalAuth } = pkg;
 import qrcode from "qrcode";
 import { botDocRef } from "./firebaseClient.js";
 import { updateDoc, serverTimestamp } from "firebase/firestore";
+import fs from "fs/promises";
+import path from "path";
 
 // ==== REGISTRO EM MEMÓRIA ====
 const clientsByEst = new Map();
@@ -19,6 +20,25 @@ async function write(ref, data) {
   try {
     await updateDoc(ref, { ...data, updatedAt: serverTimestamp() });
   } catch {}
+}
+
+/**
+ * Remove a sessão local do LocalAuth para um estabelecimento específico,
+ * garantindo que o próximo start gere um NOVO QR Code.
+ * Estrutura padrão do LocalAuth:
+ *   ./.wwebjs_auth/session-<clientId>
+ * Aqui usamos clientId = "est-{estabelecimentoId}-{clientId}" (default).
+ */
+export async function clearAuthFor(estabelecimentoId, clientId = "default") {
+  const authId = `est-${estabelecimentoId}-${clientId}`;
+  const base = path.resolve(process.cwd(), ".wwebjs_auth");
+  const sessionDir = path.join(base, `session-${authId}`);
+  try {
+    await fs.rm(sessionDir, { recursive: true, force: true });
+    // ok: pasta removida (ou já não existia)
+  } catch {
+    // silencioso
+  }
 }
 
 /**
