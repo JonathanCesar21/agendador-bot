@@ -4,7 +4,7 @@ import { initializeApp } from "firebase/app";
 import {
   getAuth,
   signInWithEmailAndPassword,
-  onAuthStateChanged
+  onAuthStateChanged,
 } from "firebase/auth";
 import {
   getFirestore,
@@ -13,7 +13,9 @@ import {
   getDoc,
   setDoc,
   updateDoc,
-  serverTimestamp
+  serverTimestamp,
+  runTransaction,
+  increment,
 } from "firebase/firestore";
 
 /** ================== Firebase App ================== */
@@ -36,13 +38,15 @@ export async function loginBot() {
   if (!email || !password) throw new Error("Defina BOT_EMAIL e BOT_PASSWORD");
   await signInWithEmailAndPassword(auth, email, password);
   return new Promise((resolve) => {
-    onAuthStateChanged(auth, (u) => { if (u) resolve(u); });
+    onAuthStateChanged(auth, (u) => {
+      if (u) resolve(u);
+    });
   });
 }
 
 /** ================== Atalhos de coleções ================== */
 export const cgAgPriv = () => collectionGroup(db, "agendamentos");
-export const cgAgPub  = () => collectionGroup(db, "agendamentos_publicos");
+export const cgAgPub = () => collectionGroup(db, "agendamentos_publicos");
 
 export function botDocRef(estabelecimentoId) {
   return doc(db, "bots", estabelecimentoId);
@@ -56,39 +60,91 @@ export async function getEstabelecimento(estabelecimentoId) {
   return snap.exists() ? { id: snap.id, ...snap.data() } : null;
 }
 
+/** (Opcional) ajuda a ler estado do bot rapidamente */
+export async function getBotState(estabelecimentoId) {
+  const bref = botDocRef(estabelecimentoId);
+  const bsnap = await getDoc(bref);
+  return bsnap.exists() ? bsnap.data() : null;
+}
+
+/** (Opcional) sinalizar comandos no doc do bot */
+export async function sendBotCommand(estabelecimentoId, command, extra = {}) {
+  const bref = botDocRef(estabelecimentoId);
+  await updateDoc(bref, {
+    command: String(command || ""),
+    commandAt: serverTimestamp(),
+    commandNonce: Math.random().toString(36).slice(2),
+    ...extra,
+  });
+}
+
 /** ================== Flags de envio (agendamentos) ================== */
 export async function markConfirmSent(dref) {
   await updateDoc(dref, {
     confirmacaoEnviada: true,
-    confirmacaoEnviadaEm: serverTimestamp()
+    confirmacaoEnviadaEm: serverTimestamp(),
   });
 }
 
 export async function markReminderSent(dref) {
   await updateDoc(dref, {
     lembreteEnviado: true,
-    lembreteEnviadoEm: serverTimestamp()
+    lembreteEnviadoEm: serverTimestamp(),
   });
 }
 
 export async function markReviewSent(dref) {
   await updateDoc(dref, {
     reviewSent: true,
-    reviewSentEm: serverTimestamp()
+    reviewSentEm: serverTimestamp(),
   });
 }
 
 /** ================== Welcome (boas-vindas) ==================
- * Guarda/consulta histórico de saudação por contato (wid) para um
- * determinado estabelecimento em:
+ * Histórico por contato (wid) em:
  * /estabelecimentos/{estId}/whatsapp_welcome/{wid}
+ * Compatível com as regras novas: lastSentAt (timestamp) e count (int).
  */
 export async function getWelcomeDoc(estId, wid) {
   const ref = doc(db, "estabelecimentos", estId, "whatsapp_welcome", wid);
   return await getDoc(ref);
 }
 
+/** Marca envio de boas-vindas (idempotente o suficiente p/ logs):
+ *  - lastSentAt = serverTimestamp()
+ *  - count += 1
+ */
 export async function markWelcomeSent(estId, wid) {
   const ref = doc(db, "estabelecimentos", estId, "whatsapp_welcome", wid);
-  await setDoc(ref, { lastSent: serverTimestamp() }, { merge: true });
+  await setDoc(
+    ref,
+    {
+      lastSentAt: serverTimestamp(),
+      count: increment(1),
+    },
+    { merge: true }
+  );
+}
+
+/** (Opcional) Versão com transação/lock — use se precisar garantir
+ *  consistência estrita (normalmente o whatsapp.js já faz um lock próprio).
+ */
+export async function txMarkWelcomeIf(estId, wid, predicateFn) {
+  const ref = doc(db, "estabelecimentos", estId, "whatsapp_welcome", wid);
+  return await runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    const current = snap.exists() ? snap.data() : {};
+    if (predicateFn && !(await predicateFn(current))) {
+      return false;
+    }
+    tx.set(
+      ref,
+      {
+        lastSentAt: serverTimestamp(),
+        count: increment(1),
+      },
+      { merge: true }
+    );
+    return true;
+  });
 }
