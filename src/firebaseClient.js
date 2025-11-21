@@ -1,4 +1,4 @@
-// src/firebaseClient.js
+// /bot/src/firebaseClient.js
 import "dotenv/config";
 import { initializeApp } from "firebase/app";
 import {
@@ -11,10 +11,12 @@ import {
   collectionGroup,
   doc,
   getDoc,
+  setDoc,
   updateDoc,
   serverTimestamp
 } from "firebase/firestore";
 
+/** ================== Firebase App ================== */
 const app = initializeApp({
   apiKey: process.env.FIREBASE_API_KEY,
   authDomain: process.env.FIREBASE_AUTH_DOMAIN,
@@ -27,6 +29,7 @@ const app = initializeApp({
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 
+/** ================== Auth do BOT ================== */
 export async function loginBot() {
   const email = process.env.BOT_EMAIL;
   const password = process.env.BOT_PASSWORD;
@@ -37,7 +40,7 @@ export async function loginBot() {
   });
 }
 
-// Helpers “equivalentes” aos do Admin:
+/** ================== Atalhos de coleções ================== */
 export const cgAgPriv = () => collectionGroup(db, "agendamentos");
 export const cgAgPub  = () => collectionGroup(db, "agendamentos_publicos");
 
@@ -45,6 +48,7 @@ export function botDocRef(estabelecimentoId) {
   return doc(db, "bots", estabelecimentoId);
 }
 
+/** ================== Leitura de estabelecimento ================== */
 export async function getEstabelecimento(estabelecimentoId) {
   if (!estabelecimentoId) return null;
   const dref = doc(db, "estabelecimentos", estabelecimentoId);
@@ -52,10 +56,39 @@ export async function getEstabelecimento(estabelecimentoId) {
   return snap.exists() ? { id: snap.id, ...snap.data() } : null;
 }
 
+/** ================== Flags de envio (agendamentos) ================== */
 export async function markConfirmSent(dref) {
-  await updateDoc(dref, { confirmacaoEnviada: true, confirmacaoEnviadaEm: serverTimestamp() });
+  await updateDoc(dref, {
+    confirmacaoEnviada: true,
+    confirmacaoEnviadaEm: serverTimestamp()
+  });
 }
 
 export async function markReminderSent(dref) {
-  await updateDoc(dref, { lembreteEnviado: true, lembreteEnviadoEm: serverTimestamp() });
+  await updateDoc(dref, {
+    lembreteEnviado: true,
+    lembreteEnviadoEm: serverTimestamp()
+  });
+}
+
+export async function markReviewSent(dref) {
+  await updateDoc(dref, {
+    reviewSent: true,
+    reviewSentEm: serverTimestamp()
+  });
+}
+
+/** ================== Welcome (boas-vindas) ==================
+ * Guarda/consulta histórico de saudação por contato (wid) para um
+ * determinado estabelecimento em:
+ * /estabelecimentos/{estId}/whatsapp_welcome/{wid}
+ */
+export async function getWelcomeDoc(estId, wid) {
+  const ref = doc(db, "estabelecimentos", estId, "whatsapp_welcome", wid);
+  return await getDoc(ref);
+}
+
+export async function markWelcomeSent(estId, wid) {
+  const ref = doc(db, "estabelecimentos", estId, "whatsapp_welcome", wid);
+  await setDoc(ref, { lastSent: serverTimestamp() }, { merge: true });
 }

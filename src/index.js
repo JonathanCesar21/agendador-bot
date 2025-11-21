@@ -1,7 +1,8 @@
+// src/index.js
 import "dotenv/config";
 import { loginBot, db, cgAgPriv, cgAgPub, botDocRef } from "./firebaseClient.js";
 import { startClientFor, stopClientFor, onClientReady, clearAuthFor } from "./whatsapp.js";
-import { startReminderCron } from "./scheduler.js";
+import { startReminderCron, startReviewCron } from "./scheduler.js";
 import {
   onSnapshot,
   collection,
@@ -23,8 +24,10 @@ async function setupWatchersForRecentConfirmations() {
   onSnapshot(qPriv, (snap) => {
     snap.docChanges().forEach(async (ch) => {
       const b = parseBooking(ch.doc);
-      console.log("[watch agendamentos] change=%s id=%s est=%s tel=%s status=%s",
-        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status);
+      console.log(
+        "[watch agendamentos] change=%s id=%s est=%s tel=%s status=%s",
+        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
+      );
       if (!b.clienteTelefone) return;
       if (ch.type === "added" || ch.type === "modified") {
         try { await maybeSendConfirm({ booking: b }); }
@@ -36,8 +39,10 @@ async function setupWatchersForRecentConfirmations() {
   onSnapshot(qPub, (snap) => {
     snap.docChanges().forEach(async (ch) => {
       const b = parseBooking(ch.doc);
-      console.log("[watch agendamentos_publicos] change=%s id=%s est=%s tel=%s status=%s",
-        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status);
+      console.log(
+        "[watch agendamentos_publicos] change=%s id=%s est=%s tel=%s status=%s",
+        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
+      );
       if (!b.clienteTelefone) return;
       if (ch.type === "added" || ch.type === "modified") {
         try { await maybeSendConfirm({ booking: b }); }
@@ -52,8 +57,9 @@ async function setupWatchersForRecentConfirmations() {
   const user = await loginBot();
   console.log("[bot] logado como:", user.email);
 
-  // Cron (lembretes T-2h)
+  // Cron (lembretes T-2h e pedidos de review +1h)
   startReminderCron();
+  startReviewCron();
 
   // Watchers para confirmações
   await setupWatchersForRecentConfirmations();
@@ -83,7 +89,11 @@ async function setupWatchersForRecentConfirmations() {
             await startClientFor(estId);    // religa → QR novo
             await updateDoc(botDocRef(estId), { command: "done" });
           } catch (e) {
-            console.error("[bots supervisor] disconnect error est=%s err=%s", estId, e?.message || e);
+            console.error(
+              "[bots supervisor] disconnect error est=%s err=%s",
+              estId,
+              e?.message || e
+            );
             try { await updateDoc(botDocRef(estId), { command: "error" }); } catch {}
           }
           continue; // evita cair na lógica de debounce start/stop abaixo nesse ciclo

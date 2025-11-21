@@ -1,8 +1,18 @@
-// /bot/src/handlers.js
 import { buildConfirmacao, buildLembrete } from "./templates.js";
-import { getEstabelecimento, markConfirmSent, markReminderSent, db } from "./firebaseClient.js";
+import {
+  getEstabelecimento,
+  markConfirmSent,
+  markReminderSent,
+  db,
+  getWelcomeDoc,
+  markWelcomeSent,
+} from "./firebaseClient.js";
+import { collectionGroup, getDocs, query, where, orderBy, Timestamp, serverTimestamp } from "firebase/firestore";
 import { getClientFor, resolveWid } from "./whatsapp.js";
-import { collectionGroup, getDocs, query, where, orderBy, Timestamp } from "firebase/firestore";
+
+// ====== Configuração/cooldown em memória ======
+const memWelcome = new Map(); // key: estId|wid  -> lastSent (ms)
+const WELCOME_COOLDOWN_MIN = Number(process.env.WELCOME_COOLDOWN_MINUTES ?? 1440); // 24h
 
 export function parseBooking(snap) {
   const data = snap.data() || {};
@@ -30,7 +40,7 @@ function allowedStatuses() {
     .map((s) => s.trim());
 }
 
-/** Envio de confirmação (on-change) — idempotente */
+/** ========== CONFIRMAÇÃO ========== */
 export async function maybeSendConfirm({ booking }) {
   const allowed = allowedStatuses();
   if (!booking?.inicio || !booking?.clienteTelefone) return;
@@ -63,7 +73,7 @@ export async function maybeSendConfirm({ booking }) {
   console.log("[CONFIRM] OK →", wid, booking.id);
 }
 
-/** Envio de lembrete (cron T-2h) — idempotente */
+/** ========== LEMBRETE (cron T-2h) ========== */
 export async function sendReminder({ booking }) {
   if (!booking?.inicio || !booking?.clienteTelefone) return;
   if (booking.lembreteEnviado) return;
@@ -82,7 +92,7 @@ export async function sendReminder({ booking }) {
 
   const wid = await resolveWid(waClient, booking.clienteTelefone);
   if (!wid || !wid.endsWith("@c.us")) {
-    console.warn("[REMINDER] skip: WID inválido ou grupo:", wid, "tel:", booking.clienteTelefone);
+    console.warn("[REMINDER] skip: WID inválido/grupo:", wid, "tel:", booking.clienteTelefone);
     return;
   }
 
@@ -91,7 +101,7 @@ export async function sendReminder({ booking }) {
   console.log("[REMINDER] OK →", wid, booking.id);
 }
 
-/** Catch-up: quando o WA fica READY, envia confirmações pendentes recentes */
+/** ========== CATCH-UP confs recentes quando READY ========== */
 export async function catchUpConfirmationsFor(estId) {
   const allowed = allowedStatuses();
   const since = Timestamp.fromDate(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
@@ -123,4 +133,84 @@ export async function catchUpConfirmationsFor(estId) {
   const a = await runOnGroup("agendamentos");
   const b = await runOnGroup("agendamentos_publicos");
   console.log(`[catch-up] est=${estId} confirmações enviadas: ${a + b}`);
+}
+
+/** ========= SAUDAÇÃO (WELCOME) =========
+ * Responde 1x por janela (config. via WELCOME_COOLDOWN_MINUTES).
+ * Usa msg.from (aceita @lid). Salva histórico em /estabelecimentos/{estId}/whatsapp_welcome/{wid}
+ */
+export async function handleIncomingMessage({ client, estId, msg }) {
+  const from = msg?.from || "";
+  if (!from || from.endsWith("@g.us")) return;
+
+  // anti-flood em memória
+  const key = `${estId}|${from}`;
+  const now = Date.now();
+  const last = memWelcome.get(key) || 0;
+  if (now - last < WELCOME_COOLDOWN_MIN * 60 * 1000) {
+    return; // dentro do cooldown em memória
+  }
+
+  // consulta Firestore (se existir doc e dentro da janela, aborta)
+  try {
+    const snap = await getWelcomeDoc(estId, from);
+    const d = snap.exists() ? (snap.data() || {}) : null;
+    const lastSentMs = d?.lastSent?.toDate ? d.lastSent.toDate().getTime() : 0;
+    if (lastSentMs && now - lastSentMs < WELCOME_COOLDOWN_MIN * 60 * 1000) {
+      memWelcome.set(key, now); // mantém cache
+      return;
+    }
+  } catch (e) {
+    console.warn("[WELCOME] read doc falhou (vai seguir mesmo assim):", e?.code || e?.message || e);
+  }
+
+  // monta mensagem
+  const est = await getEstabelecimento(estId);
+  const nome = est?.nome || "seu estabelecimento";
+  const slug = est?.slug;
+  const publicBase = process.env.PUBLIC_BASE_URL || "https://www.markja.com.br";
+  const linkAgenda = slug ? `${publicBase}/${slug}` : publicBase;
+
+  const welcomeMsg =
+    `Olá! 👋 Seja bem-vindo ao *${nome}*.\n\n` +
+    `Para agendar seu horário de forma rápida, toque aqui:\n${linkAgenda}\n\n` +
+    `Se precisar de ajuda, é só responder esta mensagem.`;
+
+  // envia
+  await client.sendMessage(from, welcomeMsg);
+  console.log("[WELCOME] OK →", from);
+
+  // marca enviado (cache + Firestore; se der erro, só loga)
+  memWelcome.set(key, now);
+  try {
+    await markWelcomeSent(estId, from);
+  } catch (e) {
+    console.warn("[WELCOME] markWelcomeSent falhou:", e?.code || e?.message || e);
+  }
+}
+
+/** ========= REVIEW (T+1h do horário) ========= */
+export async function sendReviewRequest({ booking }) {
+  // é chamado pelo scheduler (após 1h do término/início do agendamento, conforme sua lógica)
+  // Exemplo simples: só procede se estabelecimento tiver googleReviewLink
+  const waClient = getClientFor(booking.estabelecimentoId);
+  if (!waClient) return;
+
+  const est = await getEstabelecimento(booking.estabelecimentoId);
+  const reviewLink = est?.googleReviewLink;
+  if (!reviewLink) {
+    console.log("[REVIEW] skip: estabelecimento sem googleReviewLink est=", booking.estabelecimentoId);
+    return;
+  }
+
+  const wid = await resolveWid(waClient, booking.clienteTelefone);
+  if (!wid || !wid.endsWith("@c.us")) return;
+
+  const msg =
+    `Oi, ${booking.clienteNome || "tudo bem"}? 😊\n` +
+    `Seu atendimento no *${est?.nome || "estabelecimento"}* foi concluído.\n` +
+    `Pode nos avaliar rapidinho? Sua opinião é muito importante:\n${reviewLink}`;
+
+  await waClient.sendMessage(wid, msg);
+  console.log("[REVIEW] OK →", wid, booking.id);
 }
