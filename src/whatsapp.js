@@ -1,58 +1,85 @@
-// whatsapp.js
+// src/whatsapp.js
 import pkg from "whatsapp-web.js";
 const { Client, LocalAuth } = pkg;
 import qrcode from "qrcode";
+
 import fs from "fs/promises";
+import fsSync from "fs"; // existsSync
 import path from "path";
 
 import { botDocRef, db, getEstabelecimento } from "./firebaseClient.js";
 import {
   updateDoc,
+  setDoc,
   serverTimestamp,
   runTransaction,
   doc,
   increment,
 } from "firebase/firestore";
 
-/* =========================
-   REGISTROS / CALLBACKS
-   ========================= */
-const clientsByEst = new Map();
+/* =========================================================
+   ESTADO GLOBAL
+   ========================================================= */
+const clientsByEst = new Map();     // estId -> Client
+const startingByEst = new Set();    // estId em processo de start
+const readyCallbacks = new Set();   // callbacks ao ficar ready
+const healthchecks = new Map();     // estId -> { timer, lastOkAt }
 
-// Callbacks disparados quando um cliente fica READY
-const readyCallbacks = new Set();
+/** Registra callback para quando um cliente ficar "ready" */
 export function onClientReady(cb) {
   readyCallbacks.add(cb);
   return () => readyCallbacks.delete(cb);
 }
 
-async function write(ref, data) {
+/** Atualiza doc do bot com updatedAt, criando se não existir */
+async function writeSafe(ref, data) {
   try {
     await updateDoc(ref, { ...data, updatedAt: serverTimestamp() });
-  } catch {}
+  } catch {
+    try {
+      await setDoc(ref, { ...data, updatedAt: serverTimestamp() }, { merge: true });
+    } catch (e2) {
+      console.error("[bots writeSafe] falhou:", e2?.code || e2?.message || e2);
+    }
+  }
 }
 
-/* =========================
-   AUTH LOCAL (limpar sessão)
-   ========================= */
-export async function clearAuthFor(estabelecimentoId, clientId = "default") {
+/* =========================================================
+   SESSÃO (LocalAuth)
+   ========================================================= */
+function sessionDirPath(estabelecimentoId, clientId = "default") {
   const authId = `est-${estabelecimentoId}-${clientId}`;
   const base = path.resolve(process.cwd(), ".wwebjs_auth");
-  const sessionDir = path.join(base, `session-${authId}`);
-  try {
-    await fs.rm(sessionDir, { recursive: true, force: true });
-  } catch {}
+  return [
+    path.join(base, `session-${authId}`),
+    path.join(base, authId), // algumas instalações usam esse nome
+  ];
 }
 
-/* =========================
+function hasSavedSession(estabelecimentoId, clientId = "default") {
+  const paths = sessionDirPath(estabelecimentoId, clientId);
+  return paths.some((p) => {
+    try { return fsSync.existsSync(p); } catch { return false; }
+  });
+}
+
+/** Limpa a pasta da sessão com segurança (Windows-friendly) */
+export async function clearAuthFor(estabelecimentoId, clientId = "default") {
+  const paths = sessionDirPath(estabelecimentoId, clientId);
+  for (const p of paths) {
+    try { await fs.rm(p, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/* =========================================================
    HELPERS TELEFONE/WID
-   ========================= */
+   ========================================================= */
 export function toDigitsWithCountry(raw) {
   if (!raw) return null;
   const digits = String(raw).replace(/\D+/g, "");
   if (!digits) return null;
   if (digits.length === 11) return `55${digits}`; // BR
-  if (digits.length >= 12) return digits;         // já com DDI
+  if (digits.length >= 12) return digits;
   return digits;
 }
 
@@ -77,16 +104,58 @@ export async function resolveWid(client, rawPhone) {
   return null;
 }
 
-/* =========================
-   WELCOME (Boas-vindas) — de-dupe
-   ========================= */
+/* =========================================================
+   HEALTHCHECK (mantém processo saudável)
+   ========================================================= */
+function startHealthcheck(estId, client) {
+  stopHealthcheck(estId);
 
-// Cache em memória por WID para reduzir hits em sequência.
-// Ex.: 12 horas (43200000 ms). Ajuste via env se quiser.
-const WELCOME_MEM_TTL_MS = Number(process.env.WELCOME_MEM_TTL_MS || 12 * 60 * 60 * 1000);
+  const GRACE_MS = Number(process.env.HC_GRACE_MS || 120000); // 2min
+  const intervalMs = Number(process.env.HC_INTERVAL_MS || 30000); // 30s
+  const ctx = { timer: null, lastOkAt: Date.now() };
+
+  ctx.timer = setInterval(async () => {
+    try {
+      const s = client.getState ? await client.getState() : "unknown";
+      if (s) ctx.lastOkAt = Date.now();
+
+      if (Date.now() - ctx.lastOkAt > GRACE_MS) {
+        console.warn("[hc] grace excedido — restart est=", estId);
+        try { await client.destroy(); } catch {}
+        clientsByEst.delete(estId);
+        stopHealthcheck(estId);
+        startClientFor(estId).catch(() => {});
+      }
+    } catch (e) {
+      if (Date.now() - ctx.lastOkAt > GRACE_MS) {
+        console.warn("[hc] erro + grace excedido — restart est=", estId, e?.message || e);
+        try { await client.destroy(); } catch {}
+        clientsByEst.delete(estId);
+        stopHealthcheck(estId);
+        startClientFor(estId).catch(() => {});
+      }
+    }
+  }, intervalMs);
+
+  healthchecks.set(estId, ctx);
+  return ctx;
+}
+
+function stopHealthcheck(estId) {
+  const ctx = healthchecks.get(estId);
+  if (!ctx) return;
+  try { clearInterval(ctx.timer); } catch {}
+  healthchecks.delete(estId);
+}
+
+/* =========================================================
+   WELCOME (de-dupe por janela, cache+tx)
+   ========================================================= */
+const WELCOME_MEM_TTL_MS = Number(
+  process.env.WELCOME_MEM_TTL_MS || 12 * 60 * 60 * 1000
+);
 const welcomeMem = new Map(); // wid -> expiresAt(ms)
 
-/** Retorna true se o WID está "recentemente saudado" no cache. */
 function isWelcomeCached(wid) {
   const exp = welcomeMem.get(wid);
   if (!exp) return false;
@@ -96,18 +165,10 @@ function isWelcomeCached(wid) {
   return false;
 }
 
-/** Marca no cache de memória por TTL. */
 function markWelcomeCache(wid) {
   welcomeMem.set(wid, Date.now() + WELCOME_MEM_TTL_MS);
 }
 
-/**
- * Garante lock transacional por período no Firestore:
- * - Caminho: /estabelecimentos/{estId}/whatsapp_welcome/{wid}
- * - Campo: lastSentAt (timestamp), count (int)
- * - Janela de reenvio configurável (padrão 12h via WELCOME_WINDOW_HOURS)
- * Retorna true se PODE enviar agora; false se já foi enviado dentro da janela.
- */
 async function canSendWelcomeNow(estId, wid) {
   const hours = Number(process.env.WELCOME_WINDOW_HOURS || 12);
   const windowMs = hours * 60 * 60 * 1000;
@@ -120,17 +181,12 @@ async function canSendWelcomeNow(estId, wid) {
     if (snap.exists()) {
       const data = snap.data() || {};
       const last = data.lastSentAt?.toMillis ? data.lastSentAt.toMillis() : 0;
-      if (last && now - last < windowMs) {
-        return false; // dentro da janela → NÃO envia
-      }
+      if (last && now - last < windowMs) return false;
     }
 
     tx.set(
       ref,
-      {
-        lastSentAt: serverTimestamp(),
-        count: increment(1),
-      },
+      { lastSentAt: serverTimestamp(), count: increment(1) },
       { merge: true }
     );
     return true;
@@ -139,137 +195,304 @@ async function canSendWelcomeNow(estId, wid) {
   return ok;
 }
 
-/* =========================
-   START CLIENT / LISTENERS
-   ========================= */
-export async function startClientFor(estabelecimentoId, clientId = "default") {
-  if (!estabelecimentoId) throw new Error("startClientFor: estabelecimentoId ausente");
-  if (clientsByEst.has(estabelecimentoId)) {
-    return clientsByEst.get(estabelecimentoId);
-  }
+/* =========================================================
+   STARTUP GUARD (timeout & retry)
+   ========================================================= */
+function makeStartupGuard({ estId, ref, client, cancelRef, hasSession, onTimeout }) {
+  const baseMs = Number(process.env.STARTUP_TIMEOUT_MS || 60000);
+  const TIMEOUT_MS = hasSession
+    ? Number(process.env.STARTUP_TIMEOUT_WITH_SESSION_MS || 180000)
+    : baseMs;
 
-  const authId = `est-${estabelecimentoId}-${clientId}`;
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: authId }),
-    puppeteer: {
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    },
-  });
-
-  const ref = botDocRef(estabelecimentoId);
-  clientsByEst.set(estabelecimentoId, client);
-
-  client.on("qr", async (qrStr) => {
-    try {
-      const dataUrl = await qrcode.toDataURL(qrStr, { margin: 1, scale: 6 });
-      await write(ref, { state: "qr", qr: dataUrl, error: "" });
-      console.log("[wa] QR recebido (pronto para escanear).");
-    } catch (e) {
-      await write(ref, { state: "error", error: String(e?.message || e) });
-    }
-  });
-
-  client.on("authenticated", async () => {
-    await write(ref, { state: "authenticated", qr: "", error: "" });
-  });
-
-  client.on("ready", async () => {
-    const me = client.info?.wid?._serialized || "";
-    await write(ref, { state: "ready", number: me, qr: "", error: "" });
-    console.log("[wa] READY. Meu WID:", me);
-    for (const cb of readyCallbacks) {
-      try { await cb(estabelecimentoId); } catch {}
-    }
-  });
-
-  client.on("loading_screen", (pct, msg) => {
-    console.log(`[wa] loading_screen ${pct}% - ${msg}`);
-  });
-
-  client.on("disconnected", async (reason) => {
-    await write(ref, { state: "disconnected", error: String(reason || "") });
+  let fired = false;
+  const timer = setTimeout(async () => {
+    if (fired || cancelRef.cancelled) return;
+    fired = true;
+    console.warn(`[wa] startup-timeout → est=${estId} (no qr/auth/ready em ${TIMEOUT_MS}ms)`);
+    try { await writeSafe(ref, { state: "error", error: "startup-timeout" }); } catch {}
     try { await client.destroy(); } catch {}
-    clientsByEst.delete(estabelecimentoId);
-  });
+    onTimeout?.();
+  }, TIMEOUT_MS);
 
-  // =========================
-  // INBOUND (apenas 'message')
-  // =========================
+  return {
+    progress() {
+      if (fired || cancelRef.cancelled) return;
+      clearTimeout(timer);
+      cancelRef.cancelled = true;
+    },
+    cancel() {
+      if (!cancelRef.cancelled) {
+        clearTimeout(timer);
+        cancelRef.cancelled = true;
+      }
+    }
+  };
+}
+
+// Desconexões “fatais”
+const FATAL_DISCONNECT_RE =
+  /(logout|auth|bad.?session|session.*conflict|multi.*device.*mismatch)/i;
+
+/* =========================================================
+   INBOUND WELCOME (resposta automática com link)
+   ========================================================= */
+function buildWelcomeText({ estNome, agendarUrl }) {
+  return agendarUrl
+    ? `Olá! 👋 Seja bem-vindo ao ${estNome}.\n\nPara agendar seu horário de forma rápida, toque aqui:\n${agendarUrl}\n\nSe precisar de ajuda, é só responder esta mensagem.`
+    : `Olá! 👋 Você está falando com o *${estNome}*.\n\nEnvie sua mensagem com o serviço e horário desejado que retornamos em seguida.\n\nQualquer dúvida, estou por aqui!`;
+}
+
+/** Registra o listener de mensagens para um client recém-criado */
+function attachInboundWelcome(estabelecimentoId, client) {
   client.on("message", async (msg) => {
     try {
-      // Ignore mensagens que eu mesmo enviei
       if (msg.fromMe) return;
-
-      // Ignora grupos
       const chat = await msg.getChat().catch(() => null);
       if (chat?.isGroup) return;
 
-      // Normaliza WID (pode vir @c.us ou @lid)
       const wid = String(msg.from || "").trim();
       if (!wid) return;
 
       console.log("[wa] inbound accepted →", wid);
 
-      // Descobre o estId deste cliente atual
-      const estId = estabelecimentoId; // fechado por escopo do startClientFor
-      if (!estId) return;
-
-      // Cache em memória: já saudado recentemente?
       if (isWelcomeCached(wid)) return;
+      const allowed = await canSendWelcomeNow(estabelecimentoId, wid);
+      if (!allowed) { markWelcomeCache(wid); return; }
 
-      // Trava transacional (Firestore) por janela (12h por padrão)
-      const allowed = await canSendWelcomeNow(estId, wid);
-      if (!allowed) {
-        markWelcomeCache(wid);
-        return;
-      }
+      const est = await getEstabelecimento(estabelecimentoId);
+      const estNome = est?.nome || "MarkJá - Agendamentos";
+      const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+      const slug = est?.slug || "";
+      const agendarUrl = base && slug ? `${base}/${slug}` : "";
 
-      // -------- Mensagem de boas-vindas no formato solicitado --------
-      const est = await getEstabelecimento(estId);
-      const estNome = (est?.nome || "Estabelecimento").trim();
-
-      // Base pública com fallback para markja.com.br
-      const base = (process.env.PUBLIC_BASE_URL || "https://www.markja.com.br").replace(/\/+$/, "");
-      const slug = (est?.slug || "").trim();
-      const agendarUrl = slug ? `${base}/${slug}` : "";
-
-      const nomeLinha = `MarkJá - ${estNome}`;
-
-      const welcome = agendarUrl
-        ? `Olá! 👋 Seja bem-vindo ao ${nomeLinha}.\n\n` +
-          `Para agendar seu horário de forma rápida, toque aqui:\n` +
-          `${agendarUrl}\n\n` +
-          `Se precisar de ajuda, é só responder esta mensagem.`
-        : `Olá! 👋 Seja bem-vindo ao ${nomeLinha}.\n\n` +
-          `Se precisar de ajuda, é só responder esta mensagem.`;
-
-      // Responde no próprio chat (funciona para @c.us e @lid)
+      const welcome = buildWelcomeText({ estNome, agendarUrl });
       await msg.reply(welcome);
-
-      // Marca cache em memória
       markWelcomeCache(wid);
-
     } catch (e) {
-      console.warn("[WELCOME] erro ao processar mensagem de entrada:", e);
+      console.warn("[WELCOME] erro ao processar mensagem de entrada:", e?.message || e);
     }
   });
+}
 
-  await write(ref, { state: "starting", qr: "", error: "" });
+/* =========================================================
+   START / STOP CLIENT
+   ========================================================= */
+export async function startClientFor(estabelecimentoId, clientId = "default") {
+  if (!estabelecimentoId) throw new Error("startClientFor: estabelecimentoId ausente");
 
-  client.initialize().catch(async (e) => {
-    await write(ref, { state: "error", error: String(e?.message || e) });
-  });
+  if (startingByEst.has(estabelecimentoId)) return clientsByEst.get(estabelecimentoId) || null;
+  if (clientsByEst.has(estabelecimentoId)) return clientsByEst.get(estabelecimentoId);
 
-  return client;
+  startingByEst.add(estabelecimentoId);
+  const ref = botDocRef(estabelecimentoId);
+
+  let attempt = 0; // 0=inicial, 1=retry seco, 2=retry com limpeza de sessão
+
+  async function boot(useFreshSession = false) {
+    if (useFreshSession) {
+      try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+    }
+
+    const authId = `est-${estabelecimentoId}-${clientId}`;
+    const client = new Client({
+      authStrategy: new LocalAuth({ clientId: authId }),
+      puppeteer: {
+        headless: true,
+        executablePath: process.env.CHROME_PATH || undefined, // opcional
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-extensions",
+          "--disable-gpu",
+          "--disable-background-timer-throttling",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-renderer-backgrounding",
+        ],
+      },
+    });
+
+    // >>> IMPORTANTE: registrar o listener de boas-vindas <<<
+    attachInboundWelcome(estabelecimentoId, client);
+
+    clientsByEst.set(estabelecimentoId, client);
+    let hcCtrl = null;
+    const cancelRef = { cancelled: false };
+    const hasSession = hasSavedSession(estabelecimentoId, clientId);
+
+    const guard = makeStartupGuard({
+      estId: estabelecimentoId,
+      ref,
+      client,
+      cancelRef,
+      hasSession,
+      onTimeout: async () => {
+        clientsByEst.delete(estabelecimentoId);
+        stopHealthcheck(estabelecimentoId);
+
+        if (attempt === 0) {
+          attempt = 1;
+          console.warn("[wa] startup-timeout → retry (mesma sessão) est=", estabelecimentoId);
+          await writeSafe(ref, { state: "starting", error: "retry" });
+          return boot(false);
+        }
+
+        if (attempt === 1) {
+          attempt = 2;
+          console.warn("[wa] startup-timeout → clear session & retry (novo QR) est=", estabelecimentoId);
+          await writeSafe(ref, { state: "starting", error: "retry-clean" });
+          return boot(true);
+        }
+
+        startingByEst.delete(estabelecimentoId);
+        await writeSafe(ref, { state: "error", error: "startup-timeout-final" });
+      }
+    });
+
+    const progress = async (patch) => { guard.progress(); await writeSafe(ref, patch); };
+
+    client.on("qr", async (qrStr) => {
+      try {
+        const dataUrl = await qrcode.toDataURL(qrStr, { margin: 1, scale: 6 });
+        await progress({ state: "qr", qr: dataUrl, error: "" });
+        console.log("[wa] QR recebido (pronto para escanear).");
+      } catch (e) {
+        await writeSafe(ref, { state: "error", error: String(e?.message || e) });
+      }
+    });
+
+    client.on("authenticated", async () => {
+      await progress({ state: "authenticated", qr: "", error: "" });
+    });
+
+    client.on("ready", async () => {
+      startingByEst.delete(estabelecimentoId);
+      guard.cancel();
+
+      const me = client.info?.wid?._serialized || "";
+      await progress({ state: "ready", number: me, qr: "", error: "" });
+      console.log("[wa] READY. Meu WID:", me);
+
+      hcCtrl = startHealthcheck(estabelecimentoId, client);
+
+      for (const cb of readyCallbacks) {
+        try { await cb(estabelecimentoId); } catch {}
+      }
+    });
+
+    client.on("auth_failure", async (msg) => {
+      startingByEst.delete(estabelecimentoId);
+      await writeSafe(ref, { state: "error", error: "auth_failure" });
+      try { await client.destroy(); } catch {}
+      stopHealthcheck(estabelecimentoId);
+      clientsByEst.delete(estabelecimentoId);
+
+      if (attempt < 2) {
+        attempt = 2;
+        console.warn("[wa] auth_failure → clear session & retry est=", estabelecimentoId);
+        await writeSafe(ref, { state: "starting", error: "auth-failure-clean" });
+        return boot(true);
+      }
+    });
+
+    client.on("error", async (err) => {
+      const m = String(err?.message || err || "");
+      console.warn("[wa] error:", m);
+      await writeSafe(ref, { state: "disconnected", error: m, qr: "" });
+      try { await client.destroy(); } catch {}
+      stopHealthcheck(estabelecimentoId);
+      clientsByEst.delete(estabelecimentoId);
+
+      if (FATAL_DISCONNECT_RE.test(m)) {
+        if (attempt < 2) {
+          attempt = 2;
+          try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+          return boot(true);
+        }
+      } else if (attempt < 1) {
+        attempt = 1;
+        return boot(false);
+      }
+    });
+
+    client.on("change_state", async (state) => {
+      const s = String(state || "");
+      if (s) await writeSafe(ref, { state: s.toLowerCase() });
+      guard.progress();
+    });
+
+    client.on("loading_screen", () => {
+      guard.progress();
+    });
+
+    client.on("disconnected", async (reason) => {
+      const msg = String(reason || "");
+      console.warn("[wa] disconnected:", msg);
+
+      await writeSafe(ref, { state: "disconnected", error: msg, qr: "" });
+      try { await client.destroy(); } catch {}
+      stopHealthcheck(estabelecimentoId);
+      clientsByEst.delete(estabelecimentoId);
+
+      if (FATAL_DISCONNECT_RE.test(msg) || msg.toLowerCase().includes("navigation")) {
+        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+        attempt = Math.max(attempt, 2);
+        return boot(true);
+      }
+
+      if (attempt < 1) {
+        attempt = 1;
+        return boot(false);
+      }
+    });
+
+    await writeSafe(ref, { state: "starting", qr: "", error: "" });
+
+    client.initialize().catch(async (e) => {
+      const em = String(e?.message || e);
+      await writeSafe(ref, { state: "error", error: em });
+      try { await client.destroy(); } catch {}
+      stopHealthcheck(estabelecimentoId);
+      clientsByEst.delete(estabelecimentoId);
+
+      if (attempt < 1) {
+        attempt = 1;
+        return boot(false);
+      } else if (attempt < 2) {
+        attempt = 2;
+        return boot(true);
+      } else {
+        startingByEst.delete(estabelecimentoId);
+      }
+    });
+
+    return client;
+  }
+
+  const c = await boot(false);
+  return c;
 }
 
 export async function stopClientFor(estabelecimentoId) {
   const c = clientsByEst.get(estabelecimentoId);
-  if (!c) return;
+  if (!c) {
+    await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected" });
+    return;
+  }
   try { await c.destroy(); } catch {}
+  stopHealthcheck(estabelecimentoId);
   clientsByEst.delete(estabelecimentoId);
-  try { await write(botDocRef(estabelecimentoId), { state: "disconnected" }); } catch {}
+  await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected" });
+}
+
+/** Para shutdown limpo do processo */
+export async function stopAllClients() {
+  const ids = Array.from(clientsByEst.keys());
+  for (const estId of ids) {
+    try { await stopClientFor(estId); } catch {}
+  }
 }
 
 export function getClientFor(estabelecimentoId) {
