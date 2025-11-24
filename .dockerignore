@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log
+Dockerfile*
+.dockerignore
+
+# Não subir sessões para a imagem
+.wwebjs_auth
+.wwebjs_cache
+
+# Git/IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# Outros
+*.log
