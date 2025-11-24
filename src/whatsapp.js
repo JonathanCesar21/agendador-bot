@@ -45,6 +45,44 @@ async function writeSafe(ref, data) {
 }
 
 /* =========================================================
+   DETECÇÃO DE CHROME/CHROMIUM
+   ========================================================= */
+function detectChromePath() {
+  // 1) variável de ambiente explícita
+  const envPath = (process.env.CHROME_PATH || "").trim();
+  if (envPath && fsSync.existsSync(envPath)) return envPath;
+
+  // 2) caminhos comuns (Nixpacks/APT em Debian/Ubuntu)
+  const candidates = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ];
+  for (const p of candidates) {
+    if (fsSync.existsSync(p)) return p;
+  }
+
+  // 3) se não encontrou, retorna undefined (whatsapp-web.js tentará o puppeteer default)
+  return undefined;
+}
+
+function chromeLaunchArgs() {
+  return [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-gpu",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+  ];
+}
+
+/* =========================================================
    SESSÃO (LocalAuth)
    ========================================================= */
 function sessionDirPath(estabelecimentoId, clientId = "default") {
@@ -293,24 +331,22 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
     }
 
+    const execPath = detectChromePath();
+    if (!execPath) {
+      console.warn("[wa] Nenhum Chrome/Chromium detectado — defina CHROME_PATH ou instale chromium via APT.");
+      // Escreve um erro amigável para aparecer no front
+      await writeSafe(ref, { state: "error", error: "chrome-not-found", qr: "" });
+    } else {
+      console.log("[wa] Usando Chrome em:", execPath);
+    }
+
     const authId = `est-${estabelecimentoId}-${clientId}`;
     const client = new Client({
       authStrategy: new LocalAuth({ clientId: authId }),
       puppeteer: {
         headless: true,
-        executablePath: process.env.CHROME_PATH || undefined, // opcional
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--no-first-run",
-          "--no-default-browser-check",
-          "--disable-extensions",
-          "--disable-gpu",
-          "--disable-background-timer-throttling",
-          "--disable-backgrounding-occluded-windows",
-          "--disable-renderer-backgrounding",
-        ],
+        executablePath: execPath || undefined, // deixa undefined para fallback do puppeteer, se houver
+        args: chromeLaunchArgs(),
       },
     });
 
