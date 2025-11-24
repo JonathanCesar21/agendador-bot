@@ -1,0 +1,19 @@
+services:
+  markja-bot:
+    build: .
+    container_name: markja-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # override se quiser aqui também
+      - TZ=America/Sao_Paulo
+      - CHROME_PATH=/usr/bin/chromium
+      # Ex.: rodar single-tenant
+      # - ESTABELECIMENTO_ID=xxxxxxx
+      # - PUBLIC_BASE_URL=https://seu-dominio.com
+      # - REMINDER_WARMUP_MINUTES=5
+      # - REVIEW_DELAY_MINUTES=60
+    volumes:
+      - ./wweb-session:/app/.wwebjs_auth
+    # sem portas: o bot é worker

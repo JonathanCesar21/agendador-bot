@@ -1,36 +1,59 @@
-# ---- base: Debian (tem chromium via APT) ----
-FROM node:18-bookworm-slim
+# Dockerfile
+FROM node:20-bookworm-slim
 
-# Evita prompts do apt
-ENV DEBIAN_FRONTEND=noninteractive
+# Evita baixar chromium do puppeteer (não usamos puppeteer bundled)
+ENV PUPPETEER_SKIP_DOWNLOAD=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    NODE_ENV=production \
+    TZ=America/Sao_Paulo
 
-# Instala Chromium e libs necessárias p/ puppeteer/whatsapp-web.js
+# Dependências do Chromium + fontes e libs comuns a whatsapp-web.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
-    ca-certificates fonts-liberation \
-    libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 \
-    libdbus-1-3 libdrm2 libxkbcommon0 libxcomposite1 \
-    libxdamage1 libxfixes3 libxrandr2 libgbm1 libgtk-3-0 libnss3 \
-  && rm -rf /var/lib/apt/lists/*
+    fonts-liberation \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libc6 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libexpat1 \
+    libgbm1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    xdg-utils \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Informa ao seu código onde está o binário
+# Garante que whatsapp-web.js ache o binário do Chrome/Chromium
 ENV CHROME_PATH=/usr/bin/chromium
-# Desarma sandbox no container (recomendado p/ WA WebJS)
-ENV WWEBJS_NO_SANDBOX=1
-# Não baixar chrome do puppeteer
-ENV PUPPETEER_SKIP_DOWNLOAD=1
 
+# App
 WORKDIR /app
-
-# Instala dependências primeiro (cache melhor)
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# Copia o restante do projeto
-COPY . .
+# Copia código
+COPY src ./src
 
-# (Opcional) se você quiser expor uma porta; se o bot não tem HTTP, tanto faz
-EXPOSE 3000
+# Pasta de sessão do WhatsApp persistida via volume
+RUN mkdir -p /app/.wwebjs_auth && chown -R node:node /app
+VOLUME ["/app/.wwebjs_auth"]
 
-# Sobe o bot
-CMD ["npm", "run", "start"]
+USER node
+
+CMD ["npm", "start"]
