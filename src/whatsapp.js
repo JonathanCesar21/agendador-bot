@@ -62,7 +62,8 @@ function detectChromePath() {
   for (const p of candidates) {
     if (fsSync.existsSync(p)) return p;
   }
-  // 3) se não encontrou, retorna undefined (fallback do puppeteer, se houver)
+
+  // 3) se não encontrou, retorna undefined (whatsapp-web.js tentará o puppeteer default)
   return undefined;
 }
 
@@ -71,8 +72,6 @@ function chromeLaunchArgs() {
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
-    "--no-zygote",
-    "--single-process",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-extensions",
@@ -335,6 +334,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     const execPath = detectChromePath();
     if (!execPath) {
       console.warn("[wa] Nenhum Chrome/Chromium detectado — defina CHROME_PATH ou instale chromium via APT.");
+      // Escreve um erro amigável para aparecer no front
       await writeSafe(ref, { state: "error", error: "chrome-not-found", qr: "" });
     } else {
       console.log("[wa] Usando Chrome em:", execPath);
@@ -350,7 +350,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       },
     });
 
-    // listener de boas-vindas
+    // >>> IMPORTANTE: registrar o listener de boas-vindas <<<
     attachInboundWelcome(estabelecimentoId, client);
 
     clientsByEst.set(estabelecimentoId, client);
@@ -437,20 +437,9 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       const m = String(err?.message || err || "");
       console.warn("[wa] error:", m);
       await writeSafe(ref, { state: "disconnected", error: m, qr: "" });
-
       try { await client.destroy(); } catch {}
       stopHealthcheck(estabelecimentoId);
       clientsByEst.delete(estabelecimentoId);
-
-      // ⚠️ TRATAMENTO ESPECÍFICO: Chromium fechou a página (Target closed / crash)
-      const isTargetClosed = /Target closed|Target\.closed|page crashed|crash/i.test(m);
-      if (isTargetClosed) {
-        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
-        attempt = Math.max(attempt, 2); // força retry com sessão limpa (QR novo)
-        console.warn("[wa] error: target closed → clear session & retry");
-        await writeSafe(ref, { state: "starting", error: "retry-target-closed" });
-        return boot(true);
-      }
 
       if (FATAL_DISCONNECT_RE.test(m)) {
         if (attempt < 2) {
@@ -483,13 +472,9 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       stopHealthcheck(estabelecimentoId);
       clientsByEst.delete(estabelecimentoId);
 
-      // ⚠️ TRATAMENTO ESPECÍFICO: Target closed / navegação quebrada
-      const isTargetClosed = /Target closed|Target\.closed|page crashed|crash/i.test(msg);
-      if (FATAL_DISCONNECT_RE.test(msg) || /navigation/i.test(msg) || isTargetClosed) {
+      if (FATAL_DISCONNECT_RE.test(msg) || msg.toLowerCase().includes("navigation")) {
         try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
         attempt = Math.max(attempt, 2);
-        console.warn("[wa] disconnected: fatal/target closed → clear & retry");
-        await writeSafe(ref, { state: "starting", error: "retry-disconnected" });
         return boot(true);
       }
 
