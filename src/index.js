@@ -15,32 +15,36 @@ import {
   Timestamp,
   updateDoc,
 } from "firebase/firestore";
-
-import { maybeSendConfirm } from "./handlers.js";
-
-// SINGLE-TENANT opcional
-const singleEst = process.env.SINGLE_ESTABELECIMENTO_ID || "";
+import { parseBooking, maybeSendConfirm, catchUpConfirmationsFor } from "./handlers.js";
 
 /* =====================================================
-   Catch-up de confirmações pendentes
+   LIFELINE — evita queda do processo por exceções
    ===================================================== */
-async function catchUpConfirmationsFor(estabelecimentoId) {
-  // ... (mantém igual ao seu código atual) ...
+process.on("unhandledRejection", (reason) => {
+  console.warn("[process] unhandledRejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.warn("[process] uncaughtException:", err?.message || err);
+});
+
+/* Encerramento limpo ao pausar no console (CTRL+C) */
+async function shutdown() {
+  console.warn("[process] graceful shutdown…");
+  try { await stopAllClients(); } catch {}
+  process.exit(0);
 }
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 /* =====================================================
-   Parse de agendamento (priv/pub)
-   ===================================================== */
-function parseBooking(docSnap) {
-  // ... (mantém igual ao seu código atual) ...
-}
-
-/* =====================================================
-   Watchers de confirmações (recentes)
+   Debounce do campo "start" por estabelecimento
    ===================================================== */
 const lastStartFlag = new Map();
 const lastWatchQr = new Map();
 
+/* =====================================================
+   Watchers de confirmações (recentes)
+   ===================================================== */
 async function setupWatchersForRecentConfirmations() {
   const createdSince = Timestamp.fromDate(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
   const qPriv = query(cgAgPriv(), where("criadoEm", ">=", createdSince));
@@ -78,17 +82,21 @@ async function setupWatchersForRecentConfirmations() {
 }
 
 /* =====================================================
-   Main
+   BOOT
    ===================================================== */
 (async () => {
-  await loginBot();
+  console.log("[bot] login Firebase (cliente) …");
+  const user = await loginBot();
+  console.log("[bot] logado como:", user.email);
 
-  // Crons
-  startReminderCron();
-  startReviewWatcher();
+  // Cron (lembretes T-2h) + watcher de review em "feito" (realtime)
+  startReminderCron?.();
+  startReviewWatcher?.();
 
-  // Watchers de confirmações
+  // Watchers para confirmações
   await setupWatchersForRecentConfirmations();
+
+  const singleEst = process.env.ESTABELECIMENTO_ID?.trim();
 
   if (singleEst) {
     // SINGLE-TENANT

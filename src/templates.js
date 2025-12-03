@@ -4,26 +4,134 @@ import { ptBR } from "date-fns/locale";
 
 const NOME_SISTEMA = process.env.NOME_SISTEMA || "SeuSaaS";
 
+/**
+ * Monta o texto de endereço, se estiver habilitado
+ */
+function buildEnderecoTexto({
+  incluirEnderecoMensagemAuto,
+  rua,
+  numero,
+  bairro,
+  cidade,
+  uf,
+  referencia,
+  cep,
+} = {}) {
+  // se a flag não vier true, não monta nada
+  if (!incluirEnderecoMensagemAuto) return "";
+
+  const linhas = [];
+
+  // 1ª linha – rua + número
+  if (rua || numero) {
+    const ruaNum = [
+      rua || null,
+      numero ? `, ${numero}` : null,
+    ]
+      .filter(Boolean)
+      .join("");
+    if (ruaNum) linhas.push(`📍 ${ruaNum}`);
+  }
+
+  // 2ª linha – bairro / cidade / UF
+  const linhaLocal = [
+    bairro ? `Bairro ${bairro}` : null,
+    cidade || null,
+    uf || null,
+  ]
+    .filter(Boolean)
+    .join(" - ");
+  if (linhaLocal) linhas.push(linhaLocal);
+
+  // 3ª linha – referência
+  if (referencia) {
+    linhas.push(`Ref.: ${referencia}`);
+  }
+
+  // 4ª linha – CEP
+  if (cep) {
+    linhas.push(`CEP: ${cep}`);
+  }
+
+  if (!linhas.length) return "";
+
+  return `\n\n*Endereço do atendimento:*\n${linhas.join("\n")}`;
+}
+
 /** Confirmação de agendamento */
-export function buildConfirmacao({ clienteNome, estabelecimentoNome, inicio, servico }) {
+export function buildConfirmacao({
+  clienteNome,
+  estabelecimentoNome,
+  inicio,
+  servico,
+
+  // campos opcionais para endereço
+  incluirEnderecoMensagemAuto,
+  rua,
+  numero,
+  bairro,
+  cidade,
+  uf,
+  referencia,
+  cep,
+}) {
   const data = format(inicio, "dd/MM/yyyy 'às' HH:mm", { locale: ptBR });
+
+  const enderecoTexto = buildEnderecoTexto({
+    incluirEnderecoMensagemAuto,
+    rua,
+    numero,
+    bairro,
+    cidade,
+    uf,
+    referencia,
+    cep,
+  });
+
   return `${NOME_SISTEMA} • Confirmação de Agendamento
 
 Olá, ${clienteNome}! ✅
-Seu agendamento ${servico ? `de *${servico}* ` : ""}no *${estabelecimentoNome}* está *confirmado* para ${data}.
+Seu agendamento ${servico ? `de *${servico}* ` : ""}no *${estabelecimentoNome}* está *confirmado* para ${data}.${enderecoTexto}
 `;
 }
 
 /** Lembrete T-2h */
-export function buildLembrete({ clienteNome, estabelecimentoNome, inicio, servico }) {
+export function buildLembrete({
+  clienteNome,
+  estabelecimentoNome,
+  inicio,
+  servico,
+
+  // campos opcionais para endereço
+  incluirEnderecoMensagemAuto,
+  rua,
+  numero,
+  bairro,
+  cidade,
+  uf,
+  referencia,
+  cep,
+}) {
   const data = format(inicio, "dd/MM/yyyy 'às' HH:mm", { locale: ptBR });
+
+  const enderecoTexto = buildEnderecoTexto({
+    incluirEnderecoMensagemAuto,
+    rua,
+    numero,
+    bairro,
+    cidade,
+    uf,
+    referencia,
+    cep,
+  });
+
   return `${NOME_SISTEMA} • Lembrete
 
 Oi, ${clienteNome}! ⏰
 Lembrando do seu ${servico ? `*${servico}* ` : ""}no *${estabelecimentoNome}* hoje às ${format(
     inicio,
     "HH:mm"
-  )} ( ${data} ).
+  )} (${data}).${enderecoTexto}
 `;
 }
 

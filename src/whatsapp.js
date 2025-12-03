@@ -17,6 +17,8 @@ import {
   increment,
 } from "firebase/firestore";
 
+import { buildWelcome as buildWelcomeTemplate } from "./templates.js";
+
 /* =========================================================
    ESTADO GLOBAL
    ========================================================= */
@@ -24,7 +26,7 @@ const clientsByEst = new Map();     // estId -> Client
 const startingByEst = new Set();    // estId em processo de start
 const readyCallbacks = new Set();   // callbacks ao ficar ready
 const healthchecks = new Map();     // estId -> { timer, lastOkAt }
-const watchQrByEst = new Map();      // estId -> boolean (tela do robô aberta)
+const watchQrByEst = new Map();     // estId -> boolean (tela do robô aberta)
 
 /** Atualizado pelo supervisor em index.js (onSnapshot /bots) */
 export function setWatchQr(estabelecimentoId, value) {
@@ -59,9 +61,8 @@ async function writeSafe(ref, data) {
    DETECÇÃO DE CHROME/CHROMIUM
    ========================================================= */
 function detectChromePath() {
-  if (process.env.CHROME_PATH && fsSync.existsSync(process.env.CHROME_PATH)) {
-    return process.env.CHROME_PATH;
-  }
+  const envPath = (process.env.CHROME_PATH || "").trim();
+  if (envPath && fsSync.existsSync(envPath)) return envPath;
 
   const candidates = [
     // Linux
@@ -69,13 +70,17 @@ function detectChromePath() {
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
-    // Windows (paths comuns)
+    // Windows
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
   ];
 
   for (const p of candidates) {
-    if (fsSync.existsSync(p)) return p;
+    try {
+      if (fsSync.existsSync(p)) return p;
+    } catch {
+      // ignora e tenta o próximo
+    }
   }
 
   console.warn("[wa] Nenhum Chrome/Chromium encontrado nas paths padrão.");
@@ -83,100 +88,155 @@ function detectChromePath() {
 }
 
 /* =========================================================
-   GUARDIÃO DE STARTUP (timeout)
+   ARGS DE LAUNCH DO CHROME
    ========================================================= */
-function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
-  let fired = false;
-  const cancelRef = { cancelled: false };
+function chromeLaunchArgs() {
+  const base = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-gpu",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+  ];
 
-  const timer = setTimeout(async () => {
-    if (cancelRef.cancelled) return;
-    fired = true;
-    console.warn("[wa] startup timeout est:", estabelecimentoId);
-  }, timeoutMs);
+  const extra = (process.env.PUPPETEER_ARGS || "").trim();
+  if (!extra) return base;
 
-  return {
-    progress() {
-      if (fired || cancelRef.cancelled) return;
-      clearTimeout(timer);
-      cancelRef.cancelled = true;
-    },
-    cancel() {
-      if (!cancelRef.cancelled) {
-        clearTimeout(timer);
-        cancelRef.cancelled = true;
-      }
-    }
-  };
+  return base.concat(
+    extra
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
 }
 
-// Desconexões “fatais”
-const FATAL_DISCONNECT_RE = /(not-logged-in|invalid-session|auth|restart-required)/i;
-
 /* =========================================================
-   LIMPEZA DE SESSÃO
+   SESSÃO (LocalAuth)
    ========================================================= */
-async function clearAuthFor(estabelecimentoId, clientId = "default") {
-  try {
-    const base = path.join(process.cwd(), ".wwebjs_auth");
-    const sessionDir = path.join(base, `session-est-${estabelecimentoId}-${clientId}`);
-    if (fsSync.existsSync(sessionDir)) {
-      console.log("[wa] Limpando sessão em:", sessionDir);
-      await fs.rm(sessionDir, { recursive: true, force: true });
+function sessionDirPath(estabelecimentoId, clientId = "default") {
+  const authId = `est-${estabelecimentoId}-${clientId}`;
+  const base = path.resolve(process.cwd(), ".wwebjs_auth");
+  return [
+    path.join(base, `session-${authId}`),
+    path.join(base, authId), // algumas instalações usam esse nome
+  ];
+}
+
+function hasSavedSession(estabelecimentoId, clientId = "default") {
+  const paths = sessionDirPath(estabelecimentoId, clientId);
+  return paths.some((p) => {
+    try {
+      return fsSync.existsSync(p);
+    } catch {
+      return false;
     }
-  } catch (e) {
-    console.warn("[wa] clearAuthFor erro:", e?.message || e);
+  });
+}
+
+async function clearAuthFor(estabelecimentoId, clientId = "default") {
+  const paths = sessionDirPath(estabelecimentoId, clientId);
+  for (const p of paths) {
+    try {
+      if (fsSync.existsSync(p)) {
+        console.log("[wa] Limpando sessão em:", p);
+        await fs.rm(p, { recursive: true, force: true });
+      }
+    } catch (e) {
+      console.warn("[wa] clearAuthFor erro para", p, e?.message || e);
+    }
   }
 }
 
 /* =========================================================
-   HEALTHCHECK
+   HELPERS TELEFONE/WID
    ========================================================= */
-function startHealthcheck(estabelecimentoId, client) {
-  stopHealthcheck(estabelecimentoId);
-  const ref = botDocRef(estabelecimentoId);
+export function toDigitsWithCountry(raw) {
+  if (!raw) return null;
+  const digits = String(raw).replace(/\D+/g, "");
+  if (!digits) return null;
 
-  const state = {
-    timer: null,
-    lastOkAt: Date.now(),
-  };
+  // Se vier só DDD + número (11 dígitos) -> prefixa 55 (Brasil)
+  if (digits.length === 11) return `55${digits}`;
+  // Se já tiver 12+ dígitos, assume que já está com DDI
+  if (digits.length >= 12) return digits;
 
-  const loop = async () => {
-    try {
-      const st = await client.getState().catch(() => null);
-      if (st) {
-        state.lastOkAt = Date.now();
-        await writeSafe(ref, { state: String(st || "").toLowerCase(), error: "" });
-      }
-    } catch (e) {
-      console.warn("[wa] healthcheck erro:", e?.message || e);
-    }
-
-    const elapsed = Date.now() - state.lastOkAt;
-    if (elapsed > 5 * 60 * 1000) {
-      console.warn("[wa] healthcheck: cliente %s sem resposta há >5min; destruindo.", estabelecimentoId);
-      try { await client.destroy(); } catch {}
-      stopHealthcheck(estabelecimentoId);
-      clientsByEst.delete(estabelecimentoId);
-      await writeSafe(ref, { state: "disconnected", error: "healthcheck-timeout", qr: "" });
-      return;
-    }
-
-    state.timer = setTimeout(loop, 30000);
-  };
-
-  state.timer = setTimeout(loop, 30000);
-  healthchecks.set(estabelecimentoId, state);
+  return digits;
 }
 
-function stopHealthcheck(estabelecimentoId) {
-  const st = healthchecks.get(estabelecimentoId);
-  if (st?.timer) clearTimeout(st.timer);
-  healthchecks.delete(estabelecimentoId);
+export async function resolveWid(client, rawPhone) {
+  const digits = toDigitsWithCountry(rawPhone);
+  if (!digits) return null;
+
+  // 1) Tenta via getNumberId (forma “oficial” do wweb.js)
+  try {
+    const result = await client.getNumberId(digits);
+    const wid = result?._serialized;
+    if (wid && wid.endsWith("@c.us")) return wid;
+  } catch {}
+
+  // 2) Fallback: monta wid e, se possível, valida com isRegisteredUser
+  const wid = `${digits}@c.us`;
+  try {
+    if (typeof client.isRegisteredUser === "function") {
+      const ok = await client.isRegisteredUser(wid);
+      return ok ? wid : null;
+    }
+  } catch {}
+
+  return null;
 }
 
 /* =========================================================
-   BOAS-VINDAS (whatsapp_welcome)
+   HEALTHCHECK (mantém processo saudável)
+   ========================================================= */
+function startHealthcheck(estId, client) {
+  stopHealthcheck(estId);
+
+  const GRACE_MS = Number(process.env.HC_GRACE_MS || 120000); // 2min
+  const intervalMs = Number(process.env.HC_INTERVAL_MS || 30000); // 30s
+  const ctx = { timer: null, lastOkAt: Date.now() };
+
+  ctx.timer = setInterval(async () => {
+    try {
+      const s = client.getState ? await client.getState() : "unknown";
+      if (s) ctx.lastOkAt = Date.now();
+
+      if (Date.now() - ctx.lastOkAt > GRACE_MS) {
+        console.warn("[hc] grace excedido — restart est=", estId);
+        try { await client.destroy(); } catch {}
+        clientsByEst.delete(estId);
+        stopHealthcheck(estId);
+        startClientFor(estId).catch(() => {});
+      }
+    } catch (e) {
+      if (Date.now() - ctx.lastOkAt > GRACE_MS) {
+        console.warn("[hc] erro + grace excedido — restart est=", estId, e?.message || e);
+        try { await client.destroy(); } catch {}
+        clientsByEst.delete(estId);
+        stopHealthcheck(estId);
+        startClientFor(estId).catch(() => {});
+      }
+    }
+  }, intervalMs);
+
+  healthchecks.set(estId, ctx);
+  return ctx;
+}
+
+function stopHealthcheck(estId) {
+  const ctx = healthchecks.get(estId);
+  if (!ctx) return;
+  try { clearInterval(ctx.timer); } catch {}
+  healthchecks.delete(estId);
+}
+
+/* =========================================================
+   WELCOME (mensagem automática de boas-vindas)
    ========================================================= */
 const WELCOME_WINDOW_HOURS = Number(process.env.WELCOME_WINDOW_HOURS || 12);
 
@@ -200,7 +260,7 @@ async function canSendWelcomeNow(estabelecimentoId, wid) {
     const last = data.lastSentAt?.toDate ? data.lastSentAt.toDate() : null;
     const windowMs = WELCOME_WINDOW_HOURS * 60 * 60 * 1000;
 
-    if (!last || (Date.now() - last.getTime()) > windowMs) {
+    if (!last || Date.now() - last.getTime() > windowMs) {
       tx.set(ref, { lastSentAt: now, count: increment(1) }, { merge: true });
       return true;
     }
@@ -223,8 +283,12 @@ function canSendFromCache(wid, estId) {
   return elapsed > windowMs;
 }
 
-export function attachInboundWelcome(client, estabelecimentoId, welcomeText) {
-  if (!welcomeText) return;
+/**
+ * Monte aqui a mensagem automática de boas-vindas
+ * agora com suporte a endereço opcional
+ */
+function attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, enderecoTexto) {
+  if (!estabelecimentoId || !estNome || !agendarUrl) return;
 
   client.on("message", async (msg) => {
     try {
@@ -234,16 +298,50 @@ export function attachInboundWelcome(client, estabelecimentoId, welcomeText) {
       if (!canSendFromCache(wid, estabelecimentoId)) return;
       if (!(await canSendWelcomeNow(estabelecimentoId, wid))) return;
 
-      const welcome = welcomeText.replace(/\s+$/, "");
-      if (!welcome) return;
+      const welcome = buildWelcomeTemplate({
+        estabelecimentoNome: estNome,
+        agendarLink: agendarUrl,
+        enderecoTexto,
+      });
 
       await msg.reply(welcome);
-      markWelcomeCache(wid);
+      markWelcomeCache(wid, estabelecimentoId);
     } catch (e) {
       console.warn("[WELCOME] erro ao processar mensagem de entrada:", e?.message || e);
     }
   });
 }
+
+/* =========================================================
+   STARTUP GUARD (timeout & retry)
+   ========================================================= */
+function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
+  let fired = false;
+  const cancelRef = { cancelled: false };
+
+  const timer = setTimeout(async () => {
+    if (cancelRef.cancelled) return;
+    fired = true;
+    console.warn("[wa] startup timeout est:", estabelecimentoId);
+  }, timeoutMs);
+
+  return {
+    progress() {
+      if (fired || cancelRef.cancelled) return;
+      clearTimeout(timer);
+      cancelRef.cancelled = true;
+    },
+    cancel() {
+      if (!cancelRef.cancelled) {
+        clearTimeout(timer);
+        cancelRef.cancelled = true;
+      }
+    },
+  };
+}
+
+// Desconexões “fatais”
+const FATAL_DISCONNECT_RE = /(not-logged-in|invalid-session|auth|restart-required)/i;
 
 /* =========================================================
    START / STOP CLIENT
@@ -265,9 +363,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     }
 
     const execPath = detectChromePath();
-    if (!execPath) {
-      console.warn("[wa] Nenhum Chrome/Chromium detectado — defina CHROME_PATH.");
-    }
 
     const guard = makeStartupGuard({ estabelecimentoId });
 
@@ -280,7 +375,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       puppeteer: {
         headless: true,
         executablePath: execPath || undefined,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        args: chromeLaunchArgs(),
       },
     });
 
@@ -288,13 +383,56 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
 
     guard.progress();
 
+    // welcome (puxa dados do estabelecimento)
+    try {
+      const est = await getEstabelecimento(estabelecimentoId);
+      const estNome = est?.nome || "Seu estabelecimento";
+      const baseUrl = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+      const slug = est?.slug || "";
+      const agendarUrl = baseUrl && slug ? `${baseUrl}/${slug}` : "";
+
+      // flag de config que você mencionou
+      const incluirEndereco =
+        est?.config?.incluirEnderecoMensagemAuto === true ||
+        est?.incluirEnderecoMensagemAuto === true;
+
+      let enderecoTexto = "";
+
+      if (incluirEndereco) {
+        // tenta pegar de alguns campos mais prováveis,
+        // ajusta aqui conforme o que você realmente usa no /estabelecimentos
+        enderecoTexto =
+          est?.enderecoMensagem ||
+          est?.enderecoCompleto ||
+          est?.endereco ||
+          [
+            est?.enderecoLogradouro || est?.rua,
+            est?.enderecoNumero || est?.numero,
+            est?.enderecoBairro || est?.bairro,
+            (est?.enderecoCidade || est?.cidade) &&
+            (est?.enderecoUf || est?.uf)
+              ? `${est?.enderecoCidade || est?.cidade}/${est?.enderecoUf || est?.uf}`
+              : est?.enderecoCidade || est?.cidade || "",
+          ]
+            .filter(Boolean)
+            .join(", ");
+      }
+
+      // se não montou nada, deixa string vazia e o template simplesmente não mostra
+      attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, enderecoTexto || "");
+    } catch (e) {
+      console.warn("[wa] erro ao configurar welcome:", e?.message || e);
+    }
+
+    const progress = async (patch) => { guard.progress(); await writeSafe(ref, patch); };
+
     client.on("qr", async (qrStr) => {
       try {
-        // sempre avisa o guard que houve atividade, mesmo que não grave no Firestore
+        // mantém o guard vivo sempre que o WhatsApp gerar um QR
         guard.progress();
 
-        const watchFlag = watchQrByEst.get(estabelecimentoId);
-        if (watchFlag === false) {
+        const watch = watchQrByEst.get(estabelecimentoId);
+        if (watch === false) {
           console.log("[wa] QR gerado, mas watchQr=false; não escrevendo no Firestore.");
           return;
         }
@@ -303,11 +441,9 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
         await writeSafe(ref, { state: "qr", qr: dataUrl, error: "" });
         console.log("[wa] QR recebido (pronto para escanear).");
       } catch (e) {
-        await writeSafe(ref, { state: "error", error: String(e?.message || e) });
+        await writeSafe(ref, { state: "error", error: String(e?.message || e), qr: "" });
       }
     });
-
-    const progress = async (patch) => { guard.progress(); await writeSafe(ref, patch); };
 
     client.on("authenticated", async () => {
       await progress({ state: "authenticated", qr: "", error: "" });
@@ -317,10 +453,13 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       startingByEst.delete(estabelecimentoId);
       guard.cancel();
 
-      const info = await client.getNumberId((await client.getState()) ? undefined : "").catch(() => null);
-      const number = info?.user || null;
+      let number = "";
+      try {
+        const info = await client.getMe();
+        if (info?.id?._serialized) number = info.id._serialized;
+      } catch {}
 
-      await writeSafe(ref, { state: "ready", error: "", qr: "", number: number || "" });
+      await writeSafe(ref, { state: "ready", error: "", qr: "", number });
 
       startHealthcheck(estabelecimentoId, client);
 
@@ -351,13 +490,13 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       stopHealthcheck(estabelecimentoId);
       clientsByEst.delete(estabelecimentoId);
 
-      if (FATAL_DISCONNECT_RE.test(m)) {
-        if (attempt < 2) {
-          attempt = 2;
-          try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
-          return boot(true);
-        }
-      } else if (attempt < 1) {
+      if (FATAL_DISCONNECT_RE.test(m) || m.toLowerCase().includes("navigation")) {
+        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+        attempt = Math.max(attempt, 2);
+        return boot(true);
+      }
+
+      if (attempt < 1) {
         attempt = 1;
         return boot(false);
       }
@@ -366,7 +505,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     client.on("change_state", async (state) => {
       const s = String(state || "");
       if (s) console.log("[wa] change_state:", s);
-      // apenas mantém o guard vivo; não grava em /bots para reduzir writes
+      // não grava em /bots aqui para evitar flood de writes; apenas mantém o guard vivo
       guard.progress();
     });
 
@@ -383,13 +522,13 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       stopHealthcheck(estabelecimentoId);
       clientsByEst.delete(estabelecimentoId);
 
-      if (FATAL_DISCONNECT_RE.test(msg)) {
-        if (attempt < 2) {
-          attempt = 2;
-          try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
-          return boot(true);
-        }
-      } else if (attempt < 1) {
+      if (FATAL_DISCONNECT_RE.test(msg) || msg.toLowerCase().includes("navigation")) {
+        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+        attempt = Math.max(attempt, 2);
+        return boot(true);
+      }
+
+      if (attempt < 1) {
         attempt = 1;
         return boot(false);
       }
@@ -404,10 +543,12 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       guard.cancel();
       clientsByEst.delete(estabelecimentoId);
     }
+
+    return client;
   }
 
-  await boot(false);
-  return clientsByEst.get(estabelecimentoId) || null;
+  const c = await boot(false);
+  return c;
 }
 
 export async function stopClientFor(estabelecimentoId) {
@@ -417,9 +558,10 @@ export async function stopClientFor(estabelecimentoId) {
     clientsByEst.delete(estabelecimentoId);
   }
   stopHealthcheck(estabelecimentoId);
-  await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected", qr: "" });
+  await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected" });
 }
 
+/** Para shutdown limpo do processo */
 export async function stopAllClients() {
   const ids = Array.from(clientsByEst.keys());
   for (const estId of ids) {
@@ -429,27 +571,4 @@ export async function stopAllClients() {
 
 export function getClientFor(estabelecimentoId) {
   return clientsByEst.get(estabelecimentoId) || null;
-}
-
-/* =========================================================
-   HELPERS TELEFONE/WID
-   ========================================================= */
-export function toDigitsWithCountry(raw) {
-  if (!raw) return null;
-  const digits = String(raw).replace(/\D+/g, "");
-  if (!digits) return null;
-  if (digits.length === 11) return `55${digits}`; // BR
-  if (digits.length >= 12) return digits;
-  return digits;
-}
-
-export async function resolveWid(client, rawPhone) {
-  const digits = toDigitsWithCountry(rawPhone);
-  if (!digits) return null;
-  try {
-    const wid = await client.getNumberId(digits);
-    return wid?._serialized || null;
-  } catch {
-    return null;
-  }
 }
