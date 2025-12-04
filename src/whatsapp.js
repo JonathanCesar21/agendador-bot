@@ -7,14 +7,17 @@ import fs from "fs/promises";
 import fsSync from "fs"; // existsSync
 import path from "path";
 
-import { botDocRef, db, getEstabelecimento } from "./firebaseClient.js";
+import {
+  botDocRef,
+  db,
+  getEstabelecimento,
+  getWelcomeDoc,
+  markWelcomeSent,
+} from "./firebaseClient.js";
 import {
   updateDoc,
   setDoc,
   serverTimestamp,
-  runTransaction,
-  doc,
-  increment,
 } from "firebase/firestore";
 
 import { buildWelcome as buildWelcomeTemplate } from "./templates.js";
@@ -27,6 +30,7 @@ const startingByEst = new Set();    // estId em processo de start
 const readyCallbacks = new Set();   // callbacks ao ficar ready
 const healthchecks = new Map();     // estId -> { timer, lastOkAt }
 const watchQrByEst = new Map();     // estId -> boolean (tela do robô aberta)
+const readyAtByEst = new Map();     // estId -> timestamp (ms)
 
 /** Atualizado pelo supervisor em index.js (onSnapshot /bots) */
 export function setWatchQr(estabelecimentoId, value) {
@@ -123,7 +127,7 @@ function sessionDirPath(estabelecimentoId, clientId = "default") {
   const base = path.resolve(process.cwd(), ".wwebjs_auth");
   return [
     path.join(base, `session-${authId}`),
-    path.join(base, authId), // algumas instalações usam esse nome
+    path.join(base, authId),
   ];
 }
 
@@ -160,9 +164,7 @@ export function toDigitsWithCountry(raw) {
   const digits = String(raw).replace(/\D+/g, "");
   if (!digits) return null;
 
-  // Se vier só DDD + número (11 dígitos) -> prefixa 55 (Brasil)
   if (digits.length === 11) return `55${digits}`;
-  // Se já tiver 12+ dígitos, assume que já está com DDI
   if (digits.length >= 12) return digits;
 
   return digits;
@@ -172,14 +174,12 @@ export async function resolveWid(client, rawPhone) {
   const digits = toDigitsWithCountry(rawPhone);
   if (!digits) return null;
 
-  // 1) Tenta via getNumberId (forma “oficial” do wweb.js)
   try {
     const result = await client.getNumberId(digits);
     const wid = result?._serialized;
     if (wid && wid.endsWith("@c.us")) return wid;
   } catch {}
 
-  // 2) Fallback: monta wid e, se possível, valida com isRegisteredUser
   const wid = `${digits}@c.us`;
   try {
     if (typeof client.isRegisteredUser === "function") {
@@ -197,8 +197,8 @@ export async function resolveWid(client, rawPhone) {
 function startHealthcheck(estId, client) {
   stopHealthcheck(estId);
 
-  const GRACE_MS = Number(process.env.HC_GRACE_MS || 120000); // 2min
-  const intervalMs = Number(process.env.HC_INTERVAL_MS || 30000); // 30s
+  const GRACE_MS = Number(process.env.HC_GRACE_MS || 120000);
+  const intervalMs = Number(process.env.HC_INTERVAL_MS || 30000);
   const ctx = { timer: null, lastOkAt: Date.now() };
 
   ctx.timer = setInterval(async () => {
@@ -238,76 +238,157 @@ function stopHealthcheck(estId) {
 /* =========================================================
    WELCOME (mensagem automática de boas-vindas)
    ========================================================= */
-const WELCOME_WINDOW_HOURS = Number(process.env.WELCOME_WINDOW_HOURS || 12);
+const WELCOME_WINDOW_HOURS = Number(process.env.WELCOME_WINDOW_HOURS || 6);
+const WELCOME_WINDOW_MS = WELCOME_WINDOW_HOURS * 60 * 60 * 1000;
 
-function welcomeDocRef(estabelecimentoId, wid) {
-  return doc(db, "estabelecimentos", estabelecimentoId, "whatsapp_welcome", wid);
+// cache em memória: key = estId|wid -> lastSentMs
+const welcomeMem = new Map();
+const welcomeMemKey = (estId, wid) => `${estId}|${wid}`;
+
+function canSendFromMem(estId, wid) {
+  const key = welcomeMemKey(estId, wid);
+  const last = welcomeMem.get(key) || 0;
+  if (!last) return true;
+  return Date.now() - last > WELCOME_WINDOW_MS;
 }
 
-async function canSendWelcomeNow(estabelecimentoId, wid) {
-  const ref = welcomeDocRef(estabelecimentoId, wid);
-
-  return await runTransaction(db, async (tx) => {
-    const snap = await tx.get(ref);
-    const now = serverTimestamp();
-
-    if (!snap.exists()) {
-      tx.set(ref, { lastSentAt: now, count: increment(1) });
-      return true;
-    }
-
-    const data = snap.data() || {};
-    const last = data.lastSentAt?.toDate ? data.lastSentAt.toDate() : null;
-    const windowMs = WELCOME_WINDOW_HOURS * 60 * 60 * 1000;
-
-    if (!last || Date.now() - last.getTime() > windowMs) {
-      tx.set(ref, { lastSentAt: now, count: increment(1) }, { merge: true });
-      return true;
-    }
-
-    return false;
-  });
-}
-
-const welcomeMem = new Map(); // wid -> { lastSent, estId }
-
-function markWelcomeCache(wid, estId) {
-  welcomeMem.set(wid, { lastSent: Date.now(), estId });
-}
-
-function canSendFromCache(wid, estId) {
-  const entry = welcomeMem.get(wid);
-  if (!entry || entry.estId !== estId) return true;
-  const elapsed = Date.now() - entry.lastSent;
-  const windowMs = WELCOME_WINDOW_HOURS * 60 * 60 * 1000;
-  return elapsed > windowMs;
+function markWelcomeInMem(estId, wid) {
+  const key = welcomeMemKey(estId, wid);
+  welcomeMem.set(key, Date.now());
 }
 
 /**
- * Monte aqui a mensagem automática de boas-vindas
- * agora com suporte a endereço opcional
+ * Listener de mensagem de entrada para mandar boas-vindas.
+ * - Loga qualquer mensagem que chega (DBG)
+ * - Ignora grupos e broadcasts
+ * - Aceita @c.us e @lid como chats privados
+ * - Usa cooldown de 6h (memória + Firestore via getWelcomeDoc/markWelcomeSent)
+ * - Ignora mensagens antigas (antes do bot estar pronto e/ou > janela)
  */
-function attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, enderecoTexto) {
-  if (!estabelecimentoId || !estNome || !agendarUrl) return;
+function attachInboundWelcome(
+  client,
+  estabelecimentoId,
+  estNome,
+  agendarUrl,
+  enderecoTexto
+) {
+  if (!estabelecimentoId || !estNome) return;
 
   client.on("message", async (msg) => {
     try {
-      if (msg.fromMe || !msg.from.endsWith("@c.us")) return;
+      const from = msg.from || "";
+      if (!from) return;
 
-      const wid = msg.from;
-      if (!canSendFromCache(wid, estabelecimentoId)) return;
-      if (!(await canSendWelcomeNow(estabelecimentoId, wid))) return;
+      const msgTsMs = Number(msg.timestamp || 0) * 1000;
+      const tsStr = msgTsMs ? new Date(msgTsMs).toISOString() : "sem timestamp";
+
+      console.log(
+        "[DBG message] est=%s from=%s fromMe=%s type=%s ts=%s body=\"%s\"",
+        estabelecimentoId,
+        from,
+        msg.fromMe,
+        msg.type,
+        tsStr,
+        (msg.body || "").slice(0, 80).replace(/\s+/g, " ")
+      );
+
+      const now = Date.now();
+      const readyAt = readyAtByEst.get(estabelecimentoId) || 0;
+
+      // 1) Não responder o próprio número
+      if (msg.fromMe) return;
+
+      // 2) Ignorar grupos e broadcasts
+      if (from.endsWith("@g.us") || from.includes("@broadcast")) {
+        return;
+      }
+
+      // A partir daqui consideramos chats privados (@c.us, @lid, etc.)
+      const wid = from;
+
+      // 3) Ignorar mensagens anteriores ao ready (backlog antigo)
+      if (msgTsMs && readyAt && msgTsMs < readyAt) {
+        console.log(
+          "[WELCOME] ignorando msg anterior ao ready est=%s wid=%s",
+          estabelecimentoId,
+          wid
+        );
+        return;
+      }
+
+      // 4) Ignorar mensagens muito antigas (> janela)
+      if (msgTsMs && now - msgTsMs > WELCOME_WINDOW_MS) {
+        console.log(
+          "[WELCOME] ignorando msg muito antiga (> %d h) est=%s wid=%s",
+          WELCOME_WINDOW_HOURS,
+          estabelecimentoId,
+          wid
+        );
+        return;
+      }
+
+      // 5) Anti-flood em memória
+      if (!canSendFromMem(estabelecimentoId, wid)) {
+        console.log(
+          "[WELCOME] dentro do cooldown em memória, não enviando est=%s wid=%s",
+          estabelecimentoId,
+          wid
+        );
+        return;
+      }
+
+      // 6) Cooldown persistente no Firestore (campo lastSentAt)
+      try {
+        const snap = await getWelcomeDoc(estabelecimentoId, wid);
+        const data = snap.exists() ? snap.data() || {} : null;
+        const lastSentMs = data?.lastSentAt?.toDate
+          ? data.lastSentAt.toDate().getTime()
+          : 0;
+
+        if (lastSentMs && now - lastSentMs < WELCOME_WINDOW_MS) {
+          markWelcomeInMem(estabelecimentoId, wid);
+          console.log(
+            "[WELCOME] já enviado recentemente no Firestore, skip est=%s wid=%s",
+            estabelecimentoId,
+            wid
+          );
+          return;
+        }
+      } catch (e) {
+        console.warn(
+          "[WELCOME] getWelcomeDoc falhou (segue só com cache memória) est=%s wid=%s err=%s",
+          estabelecimentoId,
+          wid,
+          e?.message || e
+        );
+      }
 
       const welcome = buildWelcomeTemplate({
         estabelecimentoNome: estNome,
-        agendarLink: agendarUrl,
-        enderecoTexto,
+        agendarLink: agendarUrl || undefined,
+        enderecoTexto: enderecoTexto || "",
       });
 
       await msg.reply(welcome);
-      markWelcomeCache(wid, estabelecimentoId);
+      markWelcomeInMem(estabelecimentoId, wid);
+      console.log("[WELCOME] OK → est=%s wid=%s", estabelecimentoId, wid);
+
+      // 7) grava no Firestore (cria /whatsapp_welcome/{wid})
+      try {
+        await markWelcomeSent(estabelecimentoId, wid);
+      } catch (e) {
+        console.warn(
+          "[WELCOME] markWelcomeSent falhou est=%s wid=%s err=%s",
+          estabelecimentoId,
+          wid,
+          e?.message || e
+        );
+      }
     } catch (e) {
-      console.warn("[WELCOME] erro ao processar mensagem de entrada:", e?.message || e);
+      console.warn(
+        "[WELCOME] erro ao processar mensagem de entrada:",
+        e?.message || e
+      );
     }
   });
 }
@@ -340,7 +421,6 @@ function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
   };
 }
 
-// Desconexões “fatais”
 const FATAL_DISCONNECT_RE = /(not-logged-in|invalid-session|auth|restart-required)/i;
 
 /* =========================================================
@@ -355,7 +435,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
   startingByEst.add(estabelecimentoId);
   const ref = botDocRef(estabelecimentoId);
 
-  let attempt = 0; // 0=inicial, 1=retry seco, 2=retry com limpeza de sessão
+  let attempt = 0;
 
   async function boot(useFreshSession = false) {
     if (useFreshSession) {
@@ -363,7 +443,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     }
 
     const execPath = detectChromePath();
-
     const guard = makeStartupGuard({ estabelecimentoId });
 
     await writeSafe(ref, { state: "starting", error: "", qr: "" });
@@ -380,10 +459,9 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     });
 
     clientsByEst.set(estabelecimentoId, client);
-
     guard.progress();
 
-    // welcome (puxa dados do estabelecimento)
+    // welcome (puxa dados do estabelecimento + attach listener)
     try {
       const est = await getEstabelecimento(estabelecimentoId);
       const estNome = est?.nome || "Seu estabelecimento";
@@ -391,7 +469,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       const slug = est?.slug || "";
       const agendarUrl = baseUrl && slug ? `${baseUrl}/${slug}` : "";
 
-      // flag de config que você mencionou
       const incluirEndereco =
         est?.config?.incluirEnderecoMensagemAuto === true ||
         est?.incluirEnderecoMensagemAuto === true;
@@ -399,8 +476,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       let enderecoTexto = "";
 
       if (incluirEndereco) {
-        // tenta pegar de alguns campos mais prováveis,
-        // ajusta aqui conforme o que você realmente usa no /estabelecimentos
         enderecoTexto =
           est?.enderecoMensagem ||
           est?.enderecoCompleto ||
@@ -418,19 +493,25 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
             .join(", ");
       }
 
-      // se não montou nada, deixa string vazia e o template simplesmente não mostra
-      attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, enderecoTexto || "");
+      attachInboundWelcome(
+        client,
+        estabelecimentoId,
+        estNome,
+        agendarUrl,
+        enderecoTexto || ""
+      );
     } catch (e) {
       console.warn("[wa] erro ao configurar welcome:", e?.message || e);
     }
 
-    const progress = async (patch) => { guard.progress(); await writeSafe(ref, patch); };
+    const progress = async (patch) => {
+      guard.progress();
+      await writeSafe(ref, patch);
+    };
 
     client.on("qr", async (qrStr) => {
       try {
-        // mantém o guard vivo sempre que o WhatsApp gerar um QR
         guard.progress();
-
         const watch = watchQrByEst.get(estabelecimentoId);
         if (watch === false) {
           console.log("[wa] QR gerado, mas watchQr=false; não escrevendo no Firestore.");
@@ -453,6 +534,10 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       startingByEst.delete(estabelecimentoId);
       guard.cancel();
 
+      const now = Date.now();
+      readyAtByEst.set(estabelecimentoId, now);
+      console.log("[wa] client READY est=%s readyAt=%s", estabelecimentoId, new Date(now).toISOString());
+
       let number = "";
       try {
         const info = await client.getMe();
@@ -466,20 +551,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       readyCallbacks.forEach((cb) => {
         try { cb(estabelecimentoId); } catch {}
       });
-    });
-
-    client.on("auth_failure", async (msg) => {
-      console.warn("[wa] auth_failure est=%s msg=%s", estabelecimentoId, msg);
-      await writeSafe(ref, { state: "error", error: "auth-failure", qr: "" });
-      try { await client.destroy(); } catch {}
-      stopHealthcheck(estabelecimentoId);
-      clientsByEst.delete(estabelecimentoId);
-
-      if (attempt < 2) {
-        attempt = 2;
-        await writeSafe(ref, { state: "starting", error: "auth-failure-clean" });
-        return boot(true);
-      }
     });
 
     client.on("error", async (err) => {
@@ -505,7 +576,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     client.on("change_state", async (state) => {
       const s = String(state || "");
       if (s) console.log("[wa] change_state:", s);
-      // não grava em /bots aqui para evitar flood de writes; apenas mantém o guard vivo
       guard.progress();
     });
 
@@ -558,6 +628,7 @@ export async function stopClientFor(estabelecimentoId) {
     clientsByEst.delete(estabelecimentoId);
   }
   stopHealthcheck(estabelecimentoId);
+  readyAtByEst.delete(estabelecimentoId);
   await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected" });
 }
 

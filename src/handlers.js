@@ -1,3 +1,4 @@
+// src/handlers.js
 import { buildConfirmacao, buildLembrete } from "./templates.js";
 import {
   getEstabelecimento,
@@ -7,12 +8,21 @@ import {
   getWelcomeDoc,
   markWelcomeSent,
 } from "./firebaseClient.js";
-import { collectionGroup, getDocs, query, where, orderBy, Timestamp, serverTimestamp } from "firebase/firestore";
+import {
+  collectionGroup,
+  getDocs,
+  query,
+  where,
+  orderBy,
+  Timestamp,
+} from "firebase/firestore";
 import { getClientFor, resolveWid } from "./whatsapp.js";
 
 // ====== Configuração/cooldown em memória ======
 const memWelcome = new Map(); // key: estId|wid  -> lastSent (ms)
-const WELCOME_COOLDOWN_MIN = Number(process.env.WELCOME_COOLDOWN_MINUTES ?? 1440); // 24h
+const WELCOME_COOLDOWN_MIN = Number(
+  process.env.WELCOME_COOLDOWN_MINUTES ?? 360 // 6h
+);
 
 export function parseBooking(snap) {
   const data = snap.data() || {};
@@ -54,14 +64,11 @@ export async function maybeSendConfirm({ booking }) {
   }
 
   const est = await getEstabelecimento(booking.estabelecimentoId);
-  const estabelecimentoNome = est?.nome || "seu estabelecimento";
   const msg = buildConfirmacao({
     clienteNome: booking.clienteNome || booking.nomeCliente || "Cliente",
     estabelecimentoNome: est?.nome || "Seu estabelecimento",
     inicio: booking.inicio?.toDate ? booking.inicio.toDate() : booking.inicio,
     servico: booking.servicoNome || booking.servico || "",
-
-    // 👇 pega direto do documento do estabelecimento
     incluirEnderecoMensagemAuto: !!est?.incluirEnderecoMensagemAuto,
     rua: est?.rua,
     numero: est?.numero,
@@ -92,13 +99,11 @@ export async function sendReminder({ booking }) {
   if (!waClient) return;
 
   const est = await getEstabelecimento(booking.estabelecimentoId);
-  const estabelecimentoNome = est?.nome || "seu estabelecimento";
   const msg = buildLembrete({
     clienteNome: booking.clienteNome || booking.nomeCliente || "Cliente",
     estabelecimentoNome: est?.nome || "Seu estabelecimento",
     inicio: booking.inicio?.toDate ? booking.inicio.toDate() : booking.inicio,
     servico: booking.servicoNome || booking.servico || "",
-
     incluirEnderecoMensagemAuto: !!est?.incluirEnderecoMensagemAuto,
     rua: est?.rua,
     numero: est?.numero,
@@ -155,39 +160,74 @@ export async function catchUpConfirmationsFor(estId) {
 }
 
 /** ========= SAUDAÇÃO (WELCOME) =========
- * Responde 1x por janela (config. via WELCOME_COOLDOWN_MINUTES).
- * Usa msg.from (aceita @lid). Salva histórico em /estabelecimentos/{estId}/whatsapp_welcome/{wid}
+ * Se em algum lugar você ainda usar handleIncomingMessage,
+ * ele agora também lê lastSentAt (igual ao whatsapp.js).
  */
 export async function handleIncomingMessage({ client, estId, msg }) {
   const from = msg?.from || "";
   if (!from || from.endsWith("@g.us")) return;
 
-  // anti-flood em memória
-  const key = `${estId}|${from}`;
   const now = Date.now();
-  const last = memWelcome.get(key) || 0;
-  if (now - last < WELCOME_COOLDOWN_MIN * 60 * 1000) {
-    return; // dentro do cooldown em memória
+  const msgTsMs = Number(msg.timestamp || 0) * 1000;
+
+  const bodyPreview = (msg.body || "").slice(0, 80).replace(/\s+/g, " ");
+  console.log(
+    "[WELCOME-handle] est=%s from=%s ts=%s body=\"%s\"",
+    estId,
+    from,
+    msgTsMs ? new Date(msgTsMs).toISOString() : "sem timestamp",
+    bodyPreview
+  );
+
+  if (msgTsMs && now - msgTsMs > WELCOME_COOLDOWN_MIN * 60 * 1000) {
+    console.log(
+      "[WELCOME-handle] ignorando msg antiga (> %d min) est=%s from=%s",
+      WELCOME_COOLDOWN_MIN,
+      estId,
+      from
+    );
+    return;
   }
 
-  // consulta Firestore (se existir doc e dentro da janela, aborta)
+  const key = `${estId}|${from}`;
+  const last = memWelcome.get(key) || 0;
+  if (now - last < WELCOME_COOLDOWN_MIN * 60 * 1000) {
+    console.log(
+      "[WELCOME-handle] dentro do cooldown em memória, não respondendo est=%s from=%s",
+      estId,
+      from
+    );
+    return;
+  }
+
   try {
     const snap = await getWelcomeDoc(estId, from);
-    const d = snap.exists() ? (snap.data() || {}) : null;
-    const lastSentMs = d?.lastSent?.toDate ? d.lastSent.toDate().getTime() : 0;
+    const d = snap.exists() ? snap.data() || {} : null;
+    const lastSentMs = d?.lastSentAt?.toDate
+      ? d.lastSentAt.toDate().getTime()
+      : 0;
+
     if (lastSentMs && now - lastSentMs < WELCOME_COOLDOWN_MIN * 60 * 1000) {
-      memWelcome.set(key, now); // mantém cache
+      memWelcome.set(key, now);
+      console.log(
+        "[WELCOME-handle] já enviado recentemente no Firestore, skip est=%s from=%s",
+        estId,
+        from
+      );
       return;
     }
   } catch (e) {
-    console.warn("[WELCOME] read doc falhou (vai seguir mesmo assim):", e?.code || e?.message || e);
+    console.warn(
+      "[WELCOME-handle] read doc falhou (segue só com cache em memória):",
+      e?.code || e?.message || e
+    );
   }
 
-  // monta mensagem
   const est = await getEstabelecimento(estId);
   const nome = est?.nome || "seu estabelecimento";
   const slug = est?.slug;
-  const publicBase = process.env.PUBLIC_BASE_URL || "https://www.markja.com.br";
+  const publicBase =
+    process.env.PUBLIC_BASE_URL || "https://www.markja.com.br";
   const linkAgenda = slug ? `${publicBase}/${slug}` : publicBase;
 
   const welcomeMsg =
@@ -195,30 +235,32 @@ export async function handleIncomingMessage({ client, estId, msg }) {
     `Para agendar seu horário de forma rápida, toque aqui:\n${linkAgenda}\n\n` +
     `Se precisar de ajuda, é só responder esta mensagem.`;
 
-  // envia
   await client.sendMessage(from, welcomeMsg);
-  console.log("[WELCOME] OK →", from);
+  console.log("[WELCOME-handle] OK →", from, "est=", estId);
 
-  // marca enviado (cache + Firestore; se der erro, só loga)
   memWelcome.set(key, now);
   try {
     await markWelcomeSent(estId, from);
   } catch (e) {
-    console.warn("[WELCOME] markWelcomeSent falhou:", e?.code || e?.message || e);
+    console.warn(
+      "[WELCOME-handle] markWelcomeSent falhou:",
+      e?.code || e?.message || e
+    );
   }
 }
 
 /** ========= REVIEW (T+1h do horário) ========= */
 export async function sendReviewRequest({ booking }) {
-  // é chamado pelo scheduler (após 1h do término/início do agendamento, conforme sua lógica)
-  // Exemplo simples: só procede se estabelecimento tiver googleReviewLink
   const waClient = getClientFor(booking.estabelecimentoId);
   if (!waClient) return;
 
   const est = await getEstabelecimento(booking.estabelecimentoId);
   const reviewLink = est?.googleReviewLink;
   if (!reviewLink) {
-    console.log("[REVIEW] skip: estabelecimento sem googleReviewLink est=", booking.estabelecimentoId);
+    console.log(
+      "[REVIEW] skip: estabelecimento sem googleReviewLink est=",
+      booking.estabelecimentoId
+    );
     return;
   }
 
