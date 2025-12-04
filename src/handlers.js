@@ -56,10 +56,20 @@ export async function maybeSendConfirm({ booking }) {
   const est = await getEstabelecimento(booking.estabelecimentoId);
   const estabelecimentoNome = est?.nome || "seu estabelecimento";
   const msg = buildConfirmacao({
-    clienteNome: booking.clienteNome,
-    estabelecimentoNome,
-    inicio: booking.inicio,
-    servico: booking.servico,
+    clienteNome: booking.clienteNome || booking.nomeCliente || "Cliente",
+    estabelecimentoNome: est?.nome || "Seu estabelecimento",
+    inicio: booking.inicio?.toDate ? booking.inicio.toDate() : booking.inicio,
+    servico: booking.servicoNome || booking.servico || "",
+
+    // 👇 pega direto do documento do estabelecimento
+    incluirEnderecoMensagemAuto: !!est?.incluirEnderecoMensagemAuto,
+    rua: est?.rua,
+    numero: est?.numero,
+    bairro: est?.bairro,
+    cidade: est?.cidade,
+    uf: est?.uf,
+    referencia: est?.referencia,
+    cep: est?.cep,
   });
 
   const wid = await resolveWid(waClient, booking.clienteTelefone);
@@ -84,10 +94,19 @@ export async function sendReminder({ booking }) {
   const est = await getEstabelecimento(booking.estabelecimentoId);
   const estabelecimentoNome = est?.nome || "seu estabelecimento";
   const msg = buildLembrete({
-    clienteNome: booking.clienteNome,
-    estabelecimentoNome,
-    inicio: booking.inicio,
-    servico: booking.servico,
+    clienteNome: booking.clienteNome || booking.nomeCliente || "Cliente",
+    estabelecimentoNome: est?.nome || "Seu estabelecimento",
+    inicio: booking.inicio?.toDate ? booking.inicio.toDate() : booking.inicio,
+    servico: booking.servicoNome || booking.servico || "",
+
+    incluirEnderecoMensagemAuto: !!est?.incluirEnderecoMensagemAuto,
+    rua: est?.rua,
+    numero: est?.numero,
+    bairro: est?.bairro,
+    cidade: est?.cidade,
+    uf: est?.uf,
+    referencia: est?.referencia,
+    cep: est?.cep,
   });
 
   const wid = await resolveWid(waClient, booking.clienteTelefone);

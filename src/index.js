@@ -31,9 +31,14 @@ async function catchUpConfirmationsFor(estabelecimentoId) {
 /* =====================================================
    Parse de agendamento (priv/pub)
    ===================================================== */
+<<<<<<< HEAD
 function parseBooking(docSnap) {
   // ... (mantém igual ao seu código atual) ...
 }
+=======
+const lastStartFlag = new Map();
+const lastWatchQr = new Map();
+>>>>>>> f4b26ca5b41df17734422aed9fecffa9bbb5bd61
 
 /* =====================================================
    Watchers de confirmações (recentes)
