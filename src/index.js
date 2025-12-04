@@ -2,8 +2,20 @@
 import "dotenv/config";
 import { setTimeout as delay } from "timers/promises";
 
-import { loginBot, db, cgAgPriv, cgAgPub, botDocRef } from "./firebaseClient.js";
-import { startClientFor, stopClientFor, onClientReady, stopAllClients, setWatchQr } from "./whatsapp.js";
+import {
+  loginBot,
+  db,
+  cgAgPriv,
+  cgAgPub,
+  botDocRef,
+} from "./firebaseClient.js";
+import {
+  startClientFor,
+  stopClientFor,
+  onClientReady,
+  stopAllClients,
+  setWatchQr,
+} from "./whatsapp.js";
 import { startReminderCron } from "./scheduler.js";
 import { startReviewWatcher } from "./reviewWatcher.js";
 
@@ -15,85 +27,124 @@ import {
   Timestamp,
   updateDoc,
 } from "firebase/firestore";
-
-import { maybeSendConfirm } from "./handlers.js";
-
-// SINGLE-TENANT opcional
-const singleEst = process.env.SINGLE_ESTABELECIMENTO_ID || "";
-
-/* =====================================================
-   Catch-up de confirmações pendentes
-   ===================================================== */
-async function catchUpConfirmationsFor(estabelecimentoId) {
-  // ... (mantém igual ao seu código atual) ...
-}
+import {
+  parseBooking,
+  maybeSendConfirm,
+  catchUpConfirmationsFor,
+} from "./handlers.js";
 
 /* =====================================================
-   Parse de agendamento (priv/pub)
+   LIFELINE — evita queda do processo por exceções
    ===================================================== */
-<<<<<<< HEAD
-function parseBooking(docSnap) {
-  // ... (mantém igual ao seu código atual) ...
+process.on("unhandledRejection", (reason) => {
+  console.warn("[process] unhandledRejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.warn("[process] uncaughtException:", err?.message || err);
+});
+
+/* Encerramento limpo ao pausar no console (CTRL+C) */
+async function shutdown() {
+  console.warn("[process] graceful shutdown…");
+  try {
+    await stopAllClients();
+  } catch {}
+  process.exit(0);
 }
-=======
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+/* =====================================================
+   Debounce / flags por estabelecimento
+   ===================================================== */
 const lastStartFlag = new Map();
 const lastWatchQr = new Map();
->>>>>>> f4b26ca5b41df17734422aed9fecffa9bbb5bd61
+
+// evita rodar vários "disconnect" em paralelo para o mesmo est
+const disconnectInProgress = new Set();
 
 /* =====================================================
    Watchers de confirmações (recentes)
    ===================================================== */
-const lastStartFlag = new Map();
-const lastWatchQr = new Map();
-
 async function setupWatchersForRecentConfirmations() {
-  const createdSince = Timestamp.fromDate(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
+  const createdSince = Timestamp.fromDate(
+    new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
+  );
   const qPriv = query(cgAgPriv(), where("criadoEm", ">=", createdSince));
-  const qPub  = query(cgAgPub(),  where("criadoEm", ">=", createdSince));
+  const qPub = query(cgAgPub(), where("criadoEm", ">=", createdSince));
 
-  onSnapshot(qPriv, (snap) => {
-    snap.docChanges().forEach(async (ch) => {
-      const b = parseBooking(ch.doc);
-      console.log(
-        "[watch agendamentos] change=%s id=%s est=%s tel=%s status=%s",
-        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
-      );
-      if (!b.clienteTelefone) return;
-      if (ch.type === "added" || ch.type === "modified") {
-        try { await maybeSendConfirm({ booking: b }); }
-        catch (e) { console.error("[watch agendamentos] send error:", e); }
-      }
-    });
-  }, (err) => console.error("[watch agendamentos] err:", err));
+  onSnapshot(
+    qPriv,
+    (snap) => {
+      snap.docChanges().forEach(async (ch) => {
+        const b = parseBooking(ch.doc);
+        console.log(
+          "[watch agendamentos] change=%s id=%s est=%s tel=%s status=%s",
+          ch.type,
+          b.id,
+          b.estabelecimentoId,
+          b.clienteTelefone,
+          b.status
+        );
+        if (!b.clienteTelefone) return;
+        if (ch.type === "added" || ch.type === "modified") {
+          try {
+            await maybeSendConfirm({ booking: b });
+          } catch (e) {
+            console.error("[watch agendamentos] send error:", e);
+          }
+        }
+      });
+    },
+    (err) => console.error("[watch agendamentos] err:", err)
+  );
 
-  onSnapshot(qPub, (snap) => {
-    snap.docChanges().forEach(async (ch) => {
-      const b = parseBooking(ch.doc);
-      console.log(
-        "[watch agendamentos_publicos] change=%s id=%s est=%s tel=%s status=%s",
-        ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
-      );
-      if (!b.clienteTelefone) return;
-      if (ch.type === "added" || ch.type === "modified") {
-        try { await maybeSendConfirm({ booking: b }); }
-        catch (e) { console.error("[watch agendamentos_publicos] send error:", e); }
-      }
-    });
-  }, (err) => console.error("[watch agendamentos_publicos] err:", err));
+  onSnapshot(
+    qPub,
+    (snap) => {
+      snap.docChanges().forEach(async (ch) => {
+        const b = parseBooking(ch.doc);
+        console.log(
+          "[watch agendamentos_publicos] change=%s id=%s est=%s tel=%s status=%s",
+          ch.type,
+          b.id,
+          b.estabelecimentoId,
+          b.clienteTelefone,
+          b.status
+        );
+        if (!b.clienteTelefone) return;
+        if (ch.type === "added" || ch.type === "modified") {
+          try {
+            await maybeSendConfirm({ booking: b });
+          } catch (e) {
+            console.error(
+              "[watch agendamentos_publicos] send error:",
+              e
+            );
+          }
+        }
+      });
+    },
+    (err) => console.error("[watch agendamentos_publicos] err:", err)
+  );
 }
 
 /* =====================================================
-   Main
+   BOOT
    ===================================================== */
 (async () => {
-  await loginBot();
+  console.log("[bot] login Firebase (cliente) …");
+  const user = await loginBot();
+  console.log("[bot] logado como:", user.email);
 
-  // Crons
-  startReminderCron();
-  startReviewWatcher();
+  // Cron (lembretes T-2h) + watcher de review em "feito" (realtime)
+  startReminderCron?.();
+  startReviewWatcher?.();
 
-  // Watchers de confirmações
+  // Watchers para confirmações
   await setupWatchersForRecentConfirmations();
+
+  const singleEst = process.env.ESTABELECIMENTO_ID?.trim();
 
   if (singleEst) {
     // SINGLE-TENANT
@@ -102,61 +153,148 @@ async function setupWatchersForRecentConfirmations() {
   } else {
     // MULTI-TENANT: supervisor em /bots
     const col = collection(db, "bots");
-    onSnapshot(col, async (snap) => {
-      for (const ch of snap.docChanges()) {
-        const estId = ch.doc.id;
-        const data = ch.doc.data() || {};
-        const flag = !!data.start;
-        const cmd  = (data.command || "").toLowerCase();
+    onSnapshot(
+      col,
+      async (snap) => {
+        for (const ch of snap.docChanges()) {
+          const estId = ch.doc.id;
+          const data = ch.doc.data() || {};
+          const flag = !!data.start;
+          const cmd = (data.command || "").toLowerCase();
 
-        // Atualiza flag watchQr em memória (evita reads extras no handler de QR)
-        const watch = Object.prototype.hasOwnProperty.call(data, "watchQr")
-          ? data.watchQr
-          : undefined;
-        const prevWatch = lastWatchQr.get(estId);
-        if (prevWatch !== watch) {
-          lastWatchQr.set(estId, watch);
-          setWatchQr(estId, watch);
-        }
-
-        // 1) Comando explícito de desconexão → derruba + reinicia (gera novo QR)
-        if (cmd === "disconnect") {
-          console.log("[bots supervisor] command=disconnect est=%s", estId);
-          try {
-            await stopClientFor(estId);
-            await delay(200);                 // soltar locks do SO
-            await startClientFor(estId);
-            await updateDoc(botDocRef(estId), { command: "done" });
-          } catch (e) {
-            console.error(
-              "[bots supervisor] disconnect error est=%s err=%s",
-              estId,
-              e?.message || e
-            );
-            try { await updateDoc(botDocRef(estId), { command: "error" }); } catch {}
+          // Atualiza flag watchQr em memória (evita reads extras no handler de QR)
+          const watch = Object.prototype.hasOwnProperty.call(
+            data,
+            "watchQr"
+          )
+            ? data.watchQr
+            : undefined;
+          const prevWatch = lastWatchQr.get(estId);
+          if (prevWatch !== watch) {
+            lastWatchQr.set(estId, watch);
+            setWatchQr(estId, watch);
           }
-          continue; // evita cair no debounce abaixo
-        }
 
-        // 2) Debounce do campo start
-        const prev = lastStartFlag.get(estId);
-        if (prev !== flag) {
-          lastStartFlag.set(estId, flag);
-          console.log("[bots supervisor] change=%s est=%s start=%s", ch.type, estId, flag);
-          if (flag) await startClientFor(estId);
-          else await stopClientFor(estId);
+          // 1) Comando explícito de desconexão → derruba + reinicia (gera novo QR)
+          if (cmd === "disconnect") {
+            // evita loop de disconnect para o mesmo est
+            if (disconnectInProgress.has(estId)) {
+              console.log(
+                "[bots supervisor] disconnect já em andamento est=%s, ignorando duplicado",
+                estId
+              );
+              continue;
+            }
+
+            disconnectInProgress.add(estId);
+            console.log(
+              "[bots supervisor] command=disconnect est=%s (iniciando reset de sessão)",
+              estId
+            );
+
+            try {
+              try {
+                console.log(
+                  "[bots supervisor] stopClientFor est=%s…",
+                  estId
+                );
+                await stopClientFor(estId);
+              } catch (e) {
+                console.error(
+                  "[bots supervisor] erro ao parar cliente est=%s err=%s",
+                  estId,
+                  e?.message || e
+                );
+              }
+
+              await delay(200); // soltar locks do SO
+
+              try {
+                console.log(
+                  "[bots supervisor] startClientFor est=%s…",
+                  estId
+                );
+                await startClientFor(estId);
+              } catch (e) {
+                console.error(
+                  "[bots supervisor] erro ao iniciar cliente est=%s err=%s",
+                  estId,
+                  e?.message || e
+                );
+                // se o start falhar, vamos marcar como error (fora do try externo)
+                throw e;
+              }
+
+              try {
+                await updateDoc(botDocRef(estId), { command: "done" });
+                console.log(
+                  "[bots supervisor] disconnect est=%s finalizado (command=done)",
+                  estId
+                );
+              } catch (e) {
+                console.error(
+                  "[bots supervisor] erro ao atualizar command=done est=%s err=%s",
+                  estId,
+                  e?.message || e
+                );
+              }
+            } catch (e) {
+              console.error(
+                "[bots supervisor] disconnect error est=%s err=%s",
+                estId,
+                e?.message || e
+              );
+              try {
+                await updateDoc(botDocRef(estId), { command: "error" });
+                console.log(
+                  "[bots supervisor] est=%s marcado como command=error",
+                  estId
+                );
+              } catch (err2) {
+                console.error(
+                  "[bots supervisor] falha ao marcar command=error est=%s err=%s",
+                  estId,
+                  err2?.message || err2
+                );
+              }
+            } finally {
+              disconnectInProgress.delete(estId);
+            }
+
+            continue; // evita cair no debounce do start abaixo
+          }
+
+          // 2) Debounce do campo start (liga/desliga robô normalmente)
+          const prev = lastStartFlag.get(estId);
+          if (prev !== flag) {
+            lastStartFlag.set(estId, flag);
+            console.log(
+              "[bots supervisor] change=%s est=%s start=%s",
+              ch.type,
+              estId,
+              flag
+            );
+            if (flag) await startClientFor(estId);
+            else await stopClientFor(estId);
+          }
         }
+      },
+      (err) => {
+        console.error("[bot supervisor] onSnapshot /bots err:", err);
       }
-    }, (err) => {
-      console.error("[bot supervisor] onSnapshot /bots err:", err);
-    });
+    );
 
-    console.log("[bot] supervisor multi-tenant escutando /bots e watchers CG");
+    console.log(
+      "[bot] supervisor multi-tenant escutando /bots e watchers CG"
+    );
   }
 
   // Quando QUALQUER cliente ficar ready, roda catch-up para ele
   onClientReady(async (estId) => {
-    try { await catchUpConfirmationsFor(estId); }
-    catch (e) { console.error("[catch-up] erro:", e); }
+    try {
+      await catchUpConfirmationsFor(estId);
+    } catch (e) {
+      console.error("[catch-up] erro:", e);
+    }
   });
 })();
