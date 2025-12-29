@@ -4,7 +4,7 @@ const { Client, LocalAuth } = pkg;
 import qrcode from "qrcode";
 
 import fs from "fs/promises";
-import fsSync from "fs"; // existsSync
+import fsSync from "fs";
 import path from "path";
 
 import {
@@ -58,7 +58,6 @@ async function writeSafe(ref, data) {
    DETECÇÃO DE CHROME/CHROMIUM
    ========================================================= */
 function detectChromePath() {
-  // Preferir ENV explícito (mais confiável)
   const envPath =
     (process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH || "").trim();
   if (envPath && fsSync.existsSync(envPath)) return envPath;
@@ -77,12 +76,9 @@ function detectChromePath() {
   for (const p of candidates) {
     try {
       if (fsSync.existsSync(p)) return p;
-    } catch {
-      // ignora
-    }
+    } catch {}
   }
 
-  // Retorna null e deixa o Puppeteer usar o Chromium bundled (quando aplicável)
   return null;
 }
 
@@ -200,9 +196,7 @@ function startHealthcheck(estId, client) {
 
       if (Date.now() - ctx.lastOkAt > GRACE_MS) {
         console.warn("[hc] grace excedido — restart est=", estId);
-        try {
-          await client.destroy();
-        } catch {}
+        try { await client.destroy(); } catch {}
         clientsByEst.delete(estId);
         stopHealthcheck(estId);
         startClientFor(estId).catch(() => {});
@@ -210,9 +204,7 @@ function startHealthcheck(estId, client) {
     } catch (e) {
       if (Date.now() - ctx.lastOkAt > GRACE_MS) {
         console.warn("[hc] erro + grace excedido — restart est=", estId, e?.message || e);
-        try {
-          await client.destroy();
-        } catch {}
+        try { await client.destroy(); } catch {}
         clientsByEst.delete(estId);
         stopHealthcheck(estId);
         startClientFor(estId).catch(() => {});
@@ -227,19 +219,27 @@ function startHealthcheck(estId, client) {
 function stopHealthcheck(estId) {
   const ctx = healthchecks.get(estId);
   if (!ctx) return;
-  try {
-    clearInterval(ctx.timer);
-  } catch {}
+  try { clearInterval(ctx.timer); } catch {}
   healthchecks.delete(estId);
 }
 
 /* =========================================================
-   WELCOME
+   WELCOME (boas-vindas inbound) — com fila pre-ready
    ========================================================= */
-const WELCOME_WINDOW_HOURS = Number(process.env.WELCOME_WINDOW_HOURS || 6);
-const WELCOME_WINDOW_MS = WELCOME_WINDOW_HOURS * 60 * 60 * 1000;
+const WELCOME_COOLDOWN_HOURS = Number(
+  process.env.WELCOME_COOLDOWN_HOURS ||
+    process.env.WELCOME_WINDOW_HOURS ||
+    12
+);
+const WELCOME_COOLDOWN_MS = WELCOME_COOLDOWN_HOURS * 60 * 60 * 1000;
 
-// cache em memória: key = estId|wid -> lastSentMs
+const WELCOME_MAX_BACKLOG_HOURS = Number(process.env.WELCOME_MAX_BACKLOG_HOURS || 48);
+const WELCOME_MAX_BACKLOG_MS = WELCOME_MAX_BACKLOG_HOURS * 60 * 60 * 1000;
+
+const WELCOME_IGNORE_BEFORE_READY_MS = Number(
+  process.env.WELCOME_IGNORE_BEFORE_READY_MS || 120000
+);
+
 const welcomeMem = new Map();
 const welcomeMemKey = (estId, wid) => `${estId}|${wid}`;
 
@@ -247,7 +247,7 @@ function canSendFromMem(estId, wid) {
   const key = welcomeMemKey(estId, wid);
   const last = welcomeMem.get(key) || 0;
   if (!last) return true;
-  return Date.now() - last > WELCOME_WINDOW_MS;
+  return Date.now() - last > WELCOME_COOLDOWN_MS;
 }
 
 function markWelcomeInMem(estId, wid) {
@@ -255,8 +255,128 @@ function markWelcomeInMem(estId, wid) {
   welcomeMem.set(key, Date.now());
 }
 
+const welcomeCtxByEst = new Map(); // estId -> { estNome, agendarUrl, enderecoTexto }
+const preReadyQueueByEst = new Map(); // estId -> Map<wid, { wid, msg, msgTsMs, queuedAt }>
+
+function queuePreReadyMessage(estId, wid, msg, msgTsMs) {
+  let m = preReadyQueueByEst.get(estId);
+  if (!m) {
+    m = new Map();
+    preReadyQueueByEst.set(estId, m);
+  }
+  const prev = m.get(wid);
+  if (!prev || (msgTsMs || 0) >= (prev.msgTsMs || 0)) {
+    m.set(wid, { wid, msg, msgTsMs, queuedAt: Date.now() });
+  }
+}
+
+async function sendWelcomeText({ client, wid, text, replyMsg }) {
+  try {
+    if (replyMsg && typeof replyMsg.reply === "function") {
+      await replyMsg.reply(text);
+      return;
+    }
+  } catch {}
+  await client.sendMessage(wid, text);
+}
+
+async function sendWelcomeIfAllowed({ client, estId, wid, msg, msgTsMs, ctx, allowReply = true }) {
+  const now = Date.now();
+
+  if (msgTsMs && now - msgTsMs > WELCOME_MAX_BACKLOG_MS) {
+    console.log(
+      "[WELCOME] ignorando msg muito antiga (> %d h) est=%s wid=%s",
+      WELCOME_MAX_BACKLOG_HOURS,
+      estId,
+      wid
+    );
+    return;
+  }
+
+  if (!canSendFromMem(estId, wid)) {
+    console.log("[WELCOME] cooldown memória, skip est=%s wid=%s", estId, wid);
+    return;
+  }
+
+  try {
+    const snap = await getWelcomeDoc(estId, wid);
+    const data = snap.exists() ? snap.data() || {} : null;
+    const lastSentMs = data?.lastSentAt?.toDate ? data.lastSentAt.toDate().getTime() : 0;
+
+    if (lastSentMs && now - lastSentMs < WELCOME_COOLDOWN_MS) {
+      markWelcomeInMem(estId, wid);
+      console.log("[WELCOME] já enviado recentemente no Firestore, skip est=%s wid=%s", estId, wid);
+      return;
+    }
+  } catch (e) {
+    console.warn(
+      "[WELCOME] getWelcomeDoc falhou (segue só memória) est=%s wid=%s err=%s",
+      estId,
+      wid,
+      e?.message || e
+    );
+  }
+
+  const welcome = buildWelcomeTemplate({
+    estabelecimentoNome: ctx?.estNome || "Seu estabelecimento",
+    agendarLink: ctx?.agendarUrl || undefined,
+    enderecoTexto: ctx?.enderecoTexto || "",
+  });
+
+  await sendWelcomeText({
+    client,
+    wid,
+    text: welcome,
+    replyMsg: allowReply ? msg : null,
+  });
+
+  markWelcomeInMem(estId, wid);
+  console.log("[WELCOME] OK → est=%s wid=%s", estId, wid);
+
+  try {
+    await markWelcomeSent(estId, wid);
+  } catch (e) {
+    console.warn("[WELCOME] markWelcomeSent falhou est=%s wid=%s err=%s", estId, wid, e?.message || e);
+  }
+}
+
+async function flushPreReadyQueue(estId, client) {
+  const q = preReadyQueueByEst.get(estId);
+  if (!q || q.size === 0) return;
+
+  preReadyQueueByEst.delete(estId);
+
+  const ctx = welcomeCtxByEst.get(estId);
+  if (!ctx) return;
+
+  const items = Array.from(q.values()).sort((a, b) => (a.msgTsMs || 0) - (b.msgTsMs || 0));
+  console.log("[WELCOME] flush pre-ready est=%s qtd=%d", estId, items.length);
+
+  for (const it of items) {
+    try {
+      await sendWelcomeIfAllowed({
+        client,
+        estId,
+        wid: it.wid,
+        msg: it.msg,
+        msgTsMs: it.msgTsMs,
+        ctx,
+        allowReply: false,
+      });
+    } catch (e) {
+      console.warn("[WELCOME] flush erro est=%s wid=%s err=%s", estId, it.wid, e?.message || e);
+    }
+  }
+}
+
 function attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, enderecoTexto) {
   if (!estabelecimentoId || !estNome) return;
+
+  welcomeCtxByEst.set(estabelecimentoId, {
+    estNome,
+    agendarUrl,
+    enderecoTexto: enderecoTexto || "",
+  });
 
   client.on("message", async (msg) => {
     try {
@@ -276,75 +396,45 @@ function attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, en
         (msg.body || "").slice(0, 80).replace(/\s+/g, " ")
       );
 
-      const now = Date.now();
-      const readyAt = readyAtByEst.get(estabelecimentoId) || 0;
-
-      // 1) Não responder o próprio número
       if (msg.fromMe) return;
-
-      // 2) Ignorar grupos e broadcasts
       if (from.endsWith("@g.us") || from.includes("@broadcast")) return;
 
       const wid = from;
 
-      // 3) Ignorar mensagens anteriores ao ready
-      if (msgTsMs && readyAt && msgTsMs < readyAt) {
-        console.log("[WELCOME] ignorando msg anterior ao ready est=%s wid=%s", estabelecimentoId, wid);
+      const readyAt = readyAtByEst.get(estabelecimentoId) || 0;
+      if (!readyAt) {
+        queuePreReadyMessage(estabelecimentoId, wid, msg, msgTsMs);
+        console.log("[WELCOME] enfileirado (pre-ready) est=%s wid=%s", estabelecimentoId, wid);
         return;
       }
 
-      // 4) Ignorar mensagens muito antigas
-      if (msgTsMs && now - msgTsMs > WELCOME_WINDOW_MS) {
+      if (msgTsMs && msgTsMs < readyAt - WELCOME_IGNORE_BEFORE_READY_MS) {
         console.log(
-          "[WELCOME] ignorando msg muito antiga (> %d h) est=%s wid=%s",
-          WELCOME_WINDOW_HOURS,
-          estabelecimentoId,
-          wid
-        );
-        return;
-      }
-
-      // 5) Anti-flood em memória
-      if (!canSendFromMem(estabelecimentoId, wid)) {
-        console.log("[WELCOME] cooldown memória, skip est=%s wid=%s", estabelecimentoId, wid);
-        return;
-      }
-
-      // 6) Cooldown persistente no Firestore
-      try {
-        const snap = await getWelcomeDoc(estabelecimentoId, wid);
-        const data = snap.exists() ? snap.data() || {} : null;
-        const lastSentMs = data?.lastSentAt?.toDate ? data.lastSentAt.toDate().getTime() : 0;
-
-        if (lastSentMs && now - lastSentMs < WELCOME_WINDOW_MS) {
-          markWelcomeInMem(estabelecimentoId, wid);
-          console.log("[WELCOME] já enviado recentemente no Firestore, skip est=%s wid=%s", estabelecimentoId, wid);
-          return;
-        }
-      } catch (e) {
-        console.warn(
-          "[WELCOME] getWelcomeDoc falhou (segue só memória) est=%s wid=%s err=%s",
+          "[WELCOME] ignorando backlog anterior ao ready (>%dms) est=%s wid=%s msgTs=%s readyAt=%s",
+          WELCOME_IGNORE_BEFORE_READY_MS,
           estabelecimentoId,
           wid,
-          e?.message || e
+          new Date(msgTsMs).toISOString(),
+          new Date(readyAt).toISOString()
         );
+        return;
       }
 
-      const welcome = buildWelcomeTemplate({
-        estabelecimentoNome: estNome,
-        agendarLink: agendarUrl || undefined,
+      const ctx = welcomeCtxByEst.get(estabelecimentoId) || {
+        estNome,
+        agendarUrl,
         enderecoTexto: enderecoTexto || "",
+      };
+
+      await sendWelcomeIfAllowed({
+        client,
+        estId: estabelecimentoId,
+        wid,
+        msg,
+        msgTsMs,
+        ctx,
+        allowReply: true,
       });
-
-      await msg.reply(welcome);
-      markWelcomeInMem(estabelecimentoId, wid);
-      console.log("[WELCOME] OK → est=%s wid=%s", estabelecimentoId, wid);
-
-      try {
-        await markWelcomeSent(estabelecimentoId, wid);
-      } catch (e) {
-        console.warn("[WELCOME] markWelcomeSent falhou est=%s wid=%s err=%s", estabelecimentoId, wid, e?.message || e);
-      }
     } catch (e) {
       console.warn("[WELCOME] erro:", e?.message || e);
     }
@@ -352,7 +442,7 @@ function attachInboundWelcome(client, estabelecimentoId, estNome, agendarUrl, en
 }
 
 /* =========================================================
-   STARTUP GUARD (timeout real com reset)
+   STARTUP GUARD
    ========================================================= */
 function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
   let cancelled = false;
@@ -366,13 +456,12 @@ function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
     }, timeoutMs);
   };
 
-  // arma na criação
   arm();
 
   return {
     touch() {
       if (cancelled) return;
-      arm(); // reseta o timer
+      arm();
     },
     cancel() {
       cancelled = true;
@@ -382,6 +471,11 @@ function makeStartupGuard({ estabelecimentoId, timeoutMs = 120000 }) {
 }
 
 const FATAL_DISCONNECT_RE = /(not-logged-in|invalid-session|auth|restart-required)/i;
+
+function isFatalAuthReason(reasonText) {
+  const m = String(reasonText || "");
+  return FATAL_DISCONNECT_RE.test(m);
+}
 
 /* =========================================================
    START / STOP CLIENT
@@ -402,6 +496,9 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     stopHealthcheck(estId);
     clientsByEst.delete(estId);
     readyAtByEst.delete(estId);
+    preReadyQueueByEst.delete(estId);
+    welcomeCtxByEst.delete(estId);
+    startingByEst.delete(estId); // ✅ evita ficar travado em "starting"
   }
 
   async function boot(useFreshSession = false) {
@@ -417,10 +514,7 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     const puppeteerCfg = {
       headless: true,
       args: chromeLaunchArgs(),
-      // Só seta executablePath se realmente houver um path válido;
-      // caso contrário, deixa o puppeteer decidir.
       ...(execPath ? { executablePath: execPath } : {}),
-      // Se quiser logs do chrome:
       ...(process.env.PUPPETEER_DUMPIO === "1" ? { dumpio: true } : {}),
     };
 
@@ -479,8 +573,10 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
         guard.touch();
 
         const watch = watchQrByEst.get(estabelecimentoId);
-        if (watch === false) {
-          console.log("[wa] QR gerado, mas watchQr=false; não escrevendo no Firestore.");
+
+        // ✅ só escreve QR quando a tela do robô estiver aberta
+        if (watch !== true) {
+          console.log("[wa] QR gerado, mas watchQr!=true; não escrevendo no Firestore.");
           return;
         }
 
@@ -493,7 +589,8 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     });
 
     client.on("authenticated", async () => {
-      await progress({ state: "authenticated", qr: "", error: "" });
+      // ✅ marca “sessão ok” (scaneou/logou)
+      await progress({ state: "authenticated", qr: "", error: "", sessionOk: true });
     });
 
     client.on("loading_screen", () => {
@@ -507,7 +604,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
     });
 
     client.on("ready", async () => {
-      startingByEst.delete(estabelecimentoId);
       guard.cancel();
 
       const now = Date.now();
@@ -520,10 +616,25 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
         if (info?.id?._serialized) number = info.id._serialized;
       } catch {}
 
-      await writeSafe(ref, { state: "ready", error: "", qr: "", number });
+      // ✅ ready -> definitivamente “já conectou”
+      await writeSafe(ref, {
+        state: "ready",
+        error: "",
+        qr: "",
+        number,
+        sessionOk: true,
+        scanned: true,
+      });
+
+      try {
+        await flushPreReadyQueue(estabelecimentoId, client);
+      } catch (e) {
+        console.warn("[WELCOME] flushPreReadyQueue falhou:", e?.message || e);
+      }
 
       startHealthcheck(estabelecimentoId, client);
 
+      startingByEst.delete(estabelecimentoId); // ✅ libera
       readyCallbacks.forEach((cb) => {
         try { cb(estabelecimentoId); } catch {}
       });
@@ -533,15 +644,34 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       const m = String(err?.message || err || "");
       console.warn("[wa] error:", m);
 
+      // ✅ se for erro fatal de auth, não ficar “loopando chromium”
+      if (isFatalAuthReason(m)) {
+        const watch = watchQrByEst.get(estabelecimentoId) === true;
+
+        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+        await writeSafe(ref, {
+          state: "disconnected",
+          error: "Sessão expirada/invalidada. Abra a tela do Robô para gerar um novo QR.",
+          qr: "",
+          sessionOk: false,
+          scanned: false,
+          number: "",
+        });
+
+        await cleanup(estabelecimentoId, client);
+
+        // Só tenta subir novamente se a tela do robô estiver aberta
+        if (watch) {
+          attempt = Math.max(attempt, 2);
+          return boot(true);
+        }
+        return;
+      }
+
       await writeSafe(ref, { state: "disconnected", error: m, qr: "" });
       await cleanup(estabelecimentoId, client);
 
-      if (FATAL_DISCONNECT_RE.test(m) || m.toLowerCase().includes("navigation")) {
-        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
-        attempt = Math.max(attempt, 2);
-        return boot(true);
-      }
-
+      // retry leve p/ erros transitórios
       if (attempt < 1) {
         attempt = 1;
         return boot(false);
@@ -552,14 +682,31 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       const msg = String(reason || "");
       console.warn("[wa] disconnected:", msg);
 
+      // ✅ se for fatal auth, não loopar; espera watchQr=true
+      if (isFatalAuthReason(msg)) {
+        const watch = watchQrByEst.get(estabelecimentoId) === true;
+
+        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
+        await writeSafe(ref, {
+          state: "disconnected",
+          error: "Sessão expirada/invalidada. Abra a tela do Robô para gerar um novo QR.",
+          qr: "",
+          sessionOk: false,
+          scanned: false,
+          number: "",
+        });
+
+        await cleanup(estabelecimentoId, client);
+
+        if (watch) {
+          attempt = Math.max(attempt, 2);
+          return boot(true);
+        }
+        return;
+      }
+
       await writeSafe(ref, { state: "disconnected", error: msg, qr: "" });
       await cleanup(estabelecimentoId, client);
-
-      if (FATAL_DISCONNECT_RE.test(msg) || msg.toLowerCase().includes("navigation")) {
-        try { await clearAuthFor(estabelecimentoId, clientId); } catch {}
-        attempt = Math.max(attempt, 2);
-        return boot(true);
-      }
 
       if (attempt < 1) {
         attempt = 1;
@@ -576,7 +723,6 @@ export async function startClientFor(estabelecimentoId, clientId = "default") {
       console.error("[wa] initialize erro:", errTxt);
 
       await writeSafe(ref, { state: "error", error: errTxt, qr: "" });
-      startingByEst.delete(estabelecimentoId);
       guard.cancel();
       await cleanup(estabelecimentoId, client);
     }
@@ -595,6 +741,10 @@ export async function stopClientFor(estabelecimentoId) {
   }
   stopHealthcheck(estabelecimentoId);
   readyAtByEst.delete(estabelecimentoId);
+  preReadyQueueByEst.delete(estabelecimentoId);
+  welcomeCtxByEst.delete(estabelecimentoId);
+  startingByEst.delete(estabelecimentoId);
+
   await writeSafe(botDocRef(estabelecimentoId), { state: "disconnected" });
 }
 

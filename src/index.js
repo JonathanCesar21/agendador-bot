@@ -9,6 +9,7 @@ import {
   cgAgPub,
   botDocRef,
 } from "./firebaseClient.js";
+
 import {
   startClientFor,
   stopClientFor,
@@ -16,6 +17,7 @@ import {
   stopAllClients,
   setWatchQr,
 } from "./whatsapp.js";
+
 import { startReminderCron } from "./scheduler.js";
 import { startReviewWatcher } from "./reviewWatcher.js";
 
@@ -27,6 +29,7 @@ import {
   Timestamp,
   updateDoc,
 } from "firebase/firestore";
+
 import {
   parseBooking,
   maybeSendConfirm,
@@ -43,7 +46,6 @@ process.on("uncaughtException", (err) => {
   console.warn("[process] uncaughtException:", err?.message || err);
 });
 
-/* Encerramento limpo ao pausar no console (CTRL+C) */
 async function shutdown() {
   console.warn("[process] graceful shutdown…");
   try {
@@ -55,19 +57,54 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 /* =====================================================
-   Debounce / flags por estabelecimento
+   Maps de controle
    ===================================================== */
-const lastStartFlag = new Map();
-const lastWatchQr = new Map();
-const lastCommand = new Map(); // <-- guarda o último command visto pra cada est
+const lastWatchQr = new Map();   // estId -> boolean|undefined
+const lastCommand = new Map();   // estId -> string
+const lastRunDecision = new Map(); // estId -> boolean
+
+const stopTimers = new Map();
+const QR_IDLE_STOP_MS = Number(process.env.QR_IDLE_STOP_MS || 20000); // 20s
+
+function cancelStop(estId) {
+  const t = stopTimers.get(estId);
+  if (t) {
+    try { clearTimeout(t); } catch {}
+    stopTimers.delete(estId);
+  }
+}
+
+function scheduleStop(estId) {
+  cancelStop(estId);
+  const t = setTimeout(async () => {
+    if (lastRunDecision.get(estId) === false) {
+      try {
+        console.log("[bots supervisor] idle-stop est=%s", estId);
+        await stopClientFor(estId);
+      } catch {}
+    }
+  }, QR_IDLE_STOP_MS);
+  stopTimers.set(estId, t);
+}
+
+// TTL opcional para evitar watchQr “preso” em true se o navegador cair
+const WATCHQR_TTL_MS = Number(process.env.WATCHQR_TTL_MS || 90000); // 90s
+function isWatchQrActive(data) {
+  const watch = data?.watchQr === true;
+  if (!watch) return false;
+
+  // se não tiver watchQrAt, assume ativo (compatibilidade)
+  const t = data?.watchQrAt?.toDate ? data.watchQrAt.toDate().getTime() : 0;
+  if (!t) return true;
+
+  return Date.now() - t <= WATCHQR_TTL_MS;
+}
 
 /* =====================================================
    Watchers de confirmações (recentes)
    ===================================================== */
 async function setupWatchersForRecentConfirmations() {
-  const createdSince = Timestamp.fromDate(
-    new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
-  );
+  const createdSince = Timestamp.fromDate(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000));
   const qPriv = query(cgAgPriv(), where("criadoEm", ">=", createdSince));
   const qPub = query(cgAgPub(), where("criadoEm", ">=", createdSince));
 
@@ -78,19 +115,12 @@ async function setupWatchersForRecentConfirmations() {
         const b = parseBooking(ch.doc);
         console.log(
           "[watch agendamentos] change=%s id=%s est=%s tel=%s status=%s",
-          ch.type,
-          b.id,
-          b.estabelecimentoId,
-          b.clienteTelefone,
-          b.status
+          ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
         );
         if (!b.clienteTelefone) return;
         if (ch.type === "added" || ch.type === "modified") {
-          try {
-            await maybeSendConfirm({ booking: b });
-          } catch (e) {
-            console.error("[watch agendamentos] send error:", e);
-          }
+          try { await maybeSendConfirm({ booking: b }); }
+          catch (e) { console.error("[watch agendamentos] send error:", e); }
         }
       });
     },
@@ -104,22 +134,12 @@ async function setupWatchersForRecentConfirmations() {
         const b = parseBooking(ch.doc);
         console.log(
           "[watch agendamentos_publicos] change=%s id=%s est=%s tel=%s status=%s",
-          ch.type,
-          b.id,
-          b.estabelecimentoId,
-          b.clienteTelefone,
-          b.status
+          ch.type, b.id, b.estabelecimentoId, b.clienteTelefone, b.status
         );
         if (!b.clienteTelefone) return;
         if (ch.type === "added" || ch.type === "modified") {
-          try {
-            await maybeSendConfirm({ booking: b });
-          } catch (e) {
-            console.error(
-              "[watch agendamentos_publicos] send error:",
-              e
-            );
-          }
+          try { await maybeSendConfirm({ booking: b }); }
+          catch (e) { console.error("[watch agendamentos_publicos] send error:", e); }
         }
       });
     },
@@ -136,96 +156,83 @@ async function setupWatchersForRecentConfirmations() {
   const user = await loginBot();
   console.log("[bot] logado como:", user.email);
 
-  // Cron (lembretes T-2h) + watcher de review em "feito" (realtime)
   startReminderCron?.();
   startReviewWatcher?.();
 
-  // Watchers para confirmações
   await setupWatchersForRecentConfirmations();
 
   const singleEst = process.env.ESTABELECIMENTO_ID?.trim();
 
   if (singleEst) {
-    // SINGLE-TENANT
     await startClientFor(singleEst);
     console.log("[bot] single-tenant ativo para:", singleEst);
   } else {
-    // MULTI-TENANT: supervisor em /bots
     const col = collection(db, "bots");
+
     onSnapshot(
       col,
       async (snap) => {
         for (const ch of snap.docChanges()) {
           const estId = ch.doc.id;
           const data = ch.doc.data() || {};
-          const flag = !!data.start;
+
+          const flagStart = !!data.start;
           const cmd = (data.command || "").toLowerCase();
 
-          // Atualiza e guarda último command visto
+          // 0) command anterior
           const prevCmd = lastCommand.get(estId) || "";
           if (prevCmd !== cmd) {
             console.log(
               "[bots supervisor] est=%s command mudou: %s -> %s",
-              estId,
-              prevCmd || "(vazio)",
-              cmd || "(vazio)"
+              estId, prevCmd || "(vazio)", cmd || "(vazio)"
             );
             lastCommand.set(estId, cmd);
           }
 
-          // Atualiza flag watchQr em memória (evita reads extras no handler de QR)
-          const watch = Object.prototype.hasOwnProperty.call(
-            data,
-            "watchQr"
-          )
+          // 1) watchQr em memória (para o whatsapp.js decidir gravar QR)
+          const watch = Object.prototype.hasOwnProperty.call(data, "watchQr")
             ? data.watchQr
             : undefined;
+
           const prevWatch = lastWatchQr.get(estId);
           if (prevWatch !== watch) {
             lastWatchQr.set(estId, watch);
             setWatchQr(estId, watch);
           }
 
-          // 1) Comando explícito de desconexão → derruba + reinicia (gera novo QR)
-          //    Só executa quando HOUVER transição para "disconnect"
+          // 2) comando disconnect (mantém sua lógica)
           if (cmd === "disconnect" && prevCmd !== "disconnect") {
             console.log(
               "[bots supervisor] command=disconnect est=%s (resetando sessão uma vez)",
               estId
             );
 
+            cancelStop(estId);
+            lastRunDecision.set(estId, true);
+
             try {
               try {
-                console.log(
-                  "[bots supervisor] stopClientFor est=%s…",
-                  estId
-                );
+                console.log("[bots supervisor] stopClientFor est=%s…", estId);
                 await stopClientFor(estId);
               } catch (e) {
                 console.error(
                   "[bots supervisor] erro ao parar cliente est=%s err=%s",
-                  estId,
-                  e?.message || e
+                  estId, e?.message || e
                 );
               }
 
-              await delay(200); // soltar locks do SO
+              await delay(200);
 
               try {
-                console.log(
-                  "[bots supervisor] startClientFor est=%s…",
-                  estId
-                );
+                console.log("[bots supervisor] startClientFor est=%s…", estId);
                 await startClientFor(estId);
               } catch (e) {
                 console.error(
                   "[bots supervisor] erro ao iniciar cliente est=%s err=%s",
-                  estId,
-                  e?.message || e
+                  estId, e?.message || e
                 );
               }
 
-              // Tenta marcar como "done" (se falhar, o map lastCommand evita loop)
               try {
                 await updateDoc(botDocRef(estId), { command: "done" });
                 lastCommand.set(estId, "done");
@@ -236,48 +243,59 @@ async function setupWatchersForRecentConfirmations() {
               } catch (e) {
                 console.error(
                   "[bots supervisor] erro ao atualizar command=done est=%s err=%s",
-                  estId,
-                  e?.message || e
+                  estId, e?.message || e
                 );
               }
             } catch (e) {
               console.error(
                 "[bots supervisor] disconnect error est=%s err=%s",
-                estId,
-                e?.message || e
+                estId, e?.message || e
               );
               try {
                 await updateDoc(botDocRef(estId), { command: "error" });
                 lastCommand.set(estId, "error");
-                console.log(
-                  "[bots supervisor] est=%s marcado como command=error",
-                  estId
-                );
-              } catch (err2) {
-                console.error(
-                  "[bots supervisor] falha ao marcar command=error est=%s err=%s",
-                  estId,
-                  err2?.message || err2
-                );
-              }
+              } catch {}
             }
 
-            // não cai no debounce de start/stop
             continue;
           }
 
-          // 2) Debounce do campo start (liga/desliga robô normalmente)
-          const prev = lastStartFlag.get(estId);
-          if (prev !== flag) {
-            lastStartFlag.set(estId, flag);
+          // =========================================================
+          // ✅ DECISÃO: só inicia Chromium quando:
+          //    start=true E (watchQr ativo OU já escaneou antes)
+          // =========================================================
+
+          const numberStr = String(data.number || "").trim();
+          const scannedBefore =
+            data.sessionOk === true ||
+            data.scanned === true ||
+            (numberStr.length > 0 && numberStr.includes("@"));
+
+          const watchActive = isWatchQrActive(data);
+
+          const shouldRun = flagStart && (scannedBefore || watchActive);
+
+          const prevRun = lastRunDecision.get(estId);
+          if (prevRun !== shouldRun) {
+            lastRunDecision.set(estId, shouldRun);
+
             console.log(
-              "[bots supervisor] change=%s est=%s start=%s",
-              ch.type,
-              estId,
-              flag
+              "[bots supervisor] est=%s shouldRun=%s start=%s scannedBefore=%s watchActive=%s change=%s",
+              estId, shouldRun, flagStart, scannedBefore, watchActive, ch.type
             );
-            if (flag) await startClientFor(estId);
-            else await stopClientFor(estId);
+
+            if (shouldRun) {
+              cancelStop(estId);
+              await startClientFor(estId);
+            } else {
+              if (!flagStart) {
+                cancelStop(estId);
+                await stopClientFor(estId);
+              } else {
+                // start=true mas sem scan e sem tela Robô -> não roda
+                scheduleStop(estId);
+              }
+            }
           }
         }
       },
@@ -286,12 +304,9 @@ async function setupWatchersForRecentConfirmations() {
       }
     );
 
-    console.log(
-      "[bot] supervisor multi-tenant escutando /bots e watchers CG"
-    );
+    console.log("[bot] supervisor multi-tenant escutando /bots e watchers CG");
   }
 
-  // Quando QUALQUER cliente ficar ready, roda catch-up para ele
   onClientReady(async (estId) => {
     try {
       await catchUpConfirmationsFor(estId);
