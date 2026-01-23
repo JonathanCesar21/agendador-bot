@@ -91,7 +91,7 @@ async function trySendReview({ change }) {
 
   // Envia
   const text = buildReviewMessage({ estNome, reviewLink });
-  await client.sendMessage(wid, text);
+  await client.sendMessage(wid, text, { sendSeen: false });
 
   // Marca no doc que o review foi enviado
   await markReviewSentAtDocRef(change.doc.ref);

@@ -270,14 +270,9 @@ function queuePreReadyMessage(estId, wid, msg, msgTsMs) {
   }
 }
 
-async function sendWelcomeText({ client, wid, text, replyMsg }) {
-  try {
-    if (replyMsg && typeof replyMsg.reply === "function") {
-      await replyMsg.reply(text);
-      return;
-    }
-  } catch {}
-  await client.sendMessage(wid, text);
+async function sendWelcomeText({ client, wid, text }) {
+  // Evita sendSeen no WhatsApp Web (bug em algumas versões).
+  await client.sendMessage(wid, text, { sendSeen: false });
 }
 
 async function sendWelcomeIfAllowed({ client, estId, wid, msg, msgTsMs, ctx, allowReply = true }) {
@@ -327,7 +322,6 @@ async function sendWelcomeIfAllowed({ client, estId, wid, msg, msgTsMs, ctx, all
     client,
     wid,
     text: welcome,
-    replyMsg: allowReply ? msg : null,
   });
 
   markWelcomeInMem(estId, wid);

@@ -85,7 +85,7 @@ export async function maybeSendConfirm({ booking }) {
     return;
   }
 
-  await waClient.sendMessage(wid, msg);
+  await waClient.sendMessage(wid, msg, { sendSeen: false });
   await markConfirmSent(booking.ref);
   console.log("[CONFIRM] OK →", wid, booking.id);
 }
@@ -120,7 +120,7 @@ export async function sendReminder({ booking }) {
     return;
   }
 
-  await waClient.sendMessage(wid, msg);
+  await waClient.sendMessage(wid, msg, { sendSeen: false });
   await markReminderSent(booking.ref);
   console.log("[REMINDER] OK →", wid, booking.id);
 }
@@ -235,7 +235,7 @@ export async function handleIncomingMessage({ client, estId, msg }) {
     `Para agendar seu horário de forma rápida, toque aqui:\n${linkAgenda}\n\n` +
     `Se precisar de ajuda, é só responder esta mensagem.`;
 
-  await client.sendMessage(from, welcomeMsg);
+  await client.sendMessage(from, welcomeMsg, { sendSeen: false });
   console.log("[WELCOME-handle] OK →", from, "est=", estId);
 
   memWelcome.set(key, now);
@@ -272,6 +272,6 @@ export async function sendReviewRequest({ booking }) {
     `Seu atendimento no *${est?.nome || "estabelecimento"}* foi concluído.\n` +
     `Pode nos avaliar rapidinho? Sua opinião é muito importante:\n${reviewLink}`;
 
-  await waClient.sendMessage(wid, msg);
+  await waClient.sendMessage(wid, msg, { sendSeen: false });
   console.log("[REVIEW] OK →", wid, booking.id);
 }
